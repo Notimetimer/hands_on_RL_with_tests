@@ -1,0 +1,3 @@
+   pip install 'pip<24.1'
+   pip install 'setuptools<=66'
+   pip install 'wheel<=0.38.4'
