@@ -9,6 +9,7 @@ from torch import nn
 
 # 示例代码为PPO-截断的代码
 def moving_average(a, window_size):
+    # windowsize必须是奇数
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
     r = np.arange(1, window_size-1, 2)
@@ -119,7 +120,7 @@ class PPOContinuous:
 # 超参数
 actor_lr = 1e-4
 critic_lr = 5e-3
-num_episodes = 2000
+num_episodes = 2500  # 2000
 hidden_dim = 128
 gamma = 0.9
 lmbda = 0.9

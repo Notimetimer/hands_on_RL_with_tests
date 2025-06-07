@@ -9,6 +9,7 @@ from torch import nn
 
 # 示例代码为PPO-截断的代码
 def moving_average(a, window_size):
+    # windowsize必须是奇数
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
     r = np.arange(1, window_size-1, 2)
@@ -41,11 +42,11 @@ class ValueNet(torch.nn.Module):
         self.net = nn.Sequential(*layers)
         self.fc_out = torch.nn.Linear(prev_size, 1)
 
-        # 添加参数初始化
-        for layer in self.net:
-            if isinstance(layer, nn.Linear):
-                torch.nn.init.xavier_normal_(layer.weight, gain=0.01)
-        torch.nn.init.xavier_normal_(self.fc_out.weight, gain=0.01)
+        # # 添加参数初始化
+        # for layer in self.net:
+        #     if isinstance(layer, nn.Linear):
+        #         torch.nn.init.xavier_normal_(layer.weight, gain=0.01)
+        # torch.nn.init.xavier_normal_(self.fc_out.weight, gain=0.01)
 
     def forward(self, x):
         y = self.net(x)
@@ -66,14 +67,14 @@ class PolicyNetContinuous(torch.nn.Module):
         self.net = nn.Sequential(*layers)
         self.fc_mu = torch.nn.Linear(prev_size, action_dim)
         self.fc_std = torch.nn.Linear(prev_size, action_dim)
-        # 固定神经网络初始化参数
-        torch.nn.init.xavier_normal_(self.fc_mu.weight, gain=0.01)
-        torch.nn.init.xavier_normal_(self.fc_std.weight, gain=0.01)
+        # # 固定神经网络初始化参数
+        # torch.nn.init.xavier_normal_(self.fc_mu.weight, gain=0.01)
+        # torch.nn.init.xavier_normal_(self.fc_std.weight, gain=0.01)
 
     def forward(self, x, action_bound=2.0):
         x = self.net(x)
         mu = action_bound * torch.tanh(self.fc_mu(x))
-        std = F.softplus(self.fc_std(x)) + 1e-8
+        std = F.softplus(self.fc_std(x)) #  + 1e-8
         return mu, std
 
 
@@ -106,10 +107,11 @@ class PPOContinuous:
     def update(self, transition_dict):
         states = torch.tensor(transition_dict['states'],
                               dtype=torch.float).to(self.device)
+        # actions = torch.tensor(transition_dict['actions'],
+        #                        dtype=torch.float).view(-1, 1).to(self.device)
+        # fixme actions不适合flatten
         actions = torch.tensor(transition_dict['actions'],
-                               dtype=torch.float).view(-1, 1).to(self.device)
-        # fixme 错误写法，不能够存储并表示一维和多维动作 actions = torch.tensor(transition_dict['actions'],
-        #                        dtype=torch.float).flatten().to(self.device)
+                               dtype=torch.float).to(self.device)
         rewards = torch.tensor(transition_dict['rewards'],
                                dtype=torch.float).view(-1, 1).to(self.device)
         next_states = torch.tensor(transition_dict['next_states'],
@@ -177,8 +179,8 @@ class PPOContinuous:
 # 超参数
 actor_lr = 1e-4 # 1e-4
 critic_lr = 5e-3 # 5e-3
-num_episodes = 2000 # 2000
-hidden_dim = [128]  # 128
+num_episodes = 2000  # 2000
+hidden_dim = [120]  # 128
 gamma = 0.9
 lmbda = 0.9
 epochs = 10
@@ -227,7 +229,7 @@ plt.ylabel('Returns')
 plt.title('PPO on {}'.format(env_name))
 plt.show()
 
-mv_return = moving_average(return_list, 21)
+mv_return = moving_average(return_list, 17)  # 21
 plt.plot(episodes_list, mv_return)
 plt.xlabel('Episodes')
 plt.ylabel('Returns')
