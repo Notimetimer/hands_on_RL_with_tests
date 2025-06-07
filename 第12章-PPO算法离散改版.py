@@ -9,7 +9,6 @@ from torch import nn
 
 # 示例代码为PPO-截断的代码
 def moving_average(a, window_size):
-    # windowsize必须是奇数
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
     r = np.arange(1, window_size-1, 2)
@@ -40,7 +39,7 @@ class ValueNet(torch.nn.Module):
             layers.append(nn.ReLU())
             prev_size = layer_size
         self.net = nn.Sequential(*layers)
-        self.fc_out = torch.nn.Linear(prev_size, 1)  # todo 补充多维输出
+        self.fc_out = torch.nn.Linear(prev_size, 1)
 
         # # 添加参数初始化
         # for layer in self.net:
@@ -52,9 +51,10 @@ class ValueNet(torch.nn.Module):
         y = self.net(x)
         return self.fc_out(y)
 
-class PolicyNetContinuous(torch.nn.Module):
+
+class PolicyNetDiscrete(torch.nn.Module):
     def __init__(self, state_dim, hidden_dim, action_dim):
-        super(PolicyNetContinuous, self).__init__()
+        super(PolicyNetDiscrete, self).__init__()
         self.prelu = torch.nn.PReLU()
         self.action_dim = action_dim
         layers = []
@@ -65,26 +65,26 @@ class PolicyNetContinuous(torch.nn.Module):
             layers.append(nn.ReLU())
             prev_size = layer_size
         self.net = nn.Sequential(*layers)
-        self.fc_mu = torch.nn.Linear(prev_size, action_dim)
-        self.fc_std = torch.nn.Linear(prev_size, action_dim)
+        self.fc_out = torch.nn.Linear(prev_size, 1)
         # # 固定神经网络初始化参数
-        # torch.nn.init.xavier_normal_(self.fc_mu.weight, gain=0.01)
-        # torch.nn.init.xavier_normal_(self.fc_std.weight, gain=0.01)
+        # torch.nn.init.xavier_normal_(self.fc_out.weight, gain=0.01)
 
-    def forward(self, x, action_bound=2.0):
+    def forward(self, x):
         x = self.net(x)
-        mu = action_bound * torch.tanh(self.fc_mu(x))
-        std = F.softplus(self.fc_std(x)) #  + 1e-8
-        return mu, std
+        return F.softmax(self.fc2(x), dim=1)
+
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super(PolicyNetDiscrete, self).__init__()
+        self.fc1 = torch.nn.Linear(state_dim, hidden_dim)
+        self.fc2 = torch.nn.Linear(hidden_dim, action_dim)
 
 
 
-class PPOContinuous:
-    ''' 处理连续动作的PPO算法 '''
+class PPO_discrete:
+    ''' PPO算法,采用截断方式 '''
     def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
                  lmbda, epochs, eps, gamma, device):
-        self.actor = PolicyNetContinuous(state_dim, hidden_dim,
-                                         action_dim).to(device)
+        self.actor = PolicyNetDiscrete(state_dim, hidden_dim, action_dim).to(device)
         self.critic = ValueNet(state_dim, hidden_dim).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
                                                 lr=actor_lr)
@@ -92,111 +92,71 @@ class PPOContinuous:
                                                  lr=critic_lr)
         self.gamma = gamma
         self.lmbda = lmbda
-        self.epochs = epochs
-        self.eps = eps
+        self.epochs = epochs  # 一条序列的数据用来训练轮数
+        self.eps = eps  # PPO中截断范围的参数
         self.device = device
 
-    def take_action(self, state, action_bound=2.0):
+    def take_action(self, state):
         state = torch.tensor([state], dtype=torch.float).to(self.device)
-        mu, sigma = self.actor(state, action_bound=action_bound)
-        action_dist = torch.distributions.Normal(mu, sigma)
+        probs = self.actor(state)
+        action_dist = torch.distributions.Categorical(probs) # 离散的输出为类别分布
         action = action_dist.sample()
-        return action[0].cpu().detach().numpy().flatten()  # 支持一维和多维动作，而不是.item只支持1维或.squeeze只支持多维
-        # return [action.item()]
+        return action.item()
 
     def update(self, transition_dict):
         states = torch.tensor(transition_dict['states'],
                               dtype=torch.float).to(self.device)
-        # actions = torch.tensor(transition_dict['actions'],
-        #                        dtype=torch.float).view(-1, 1).to(self.device)
-        # fixme actions不适合flatten
-        actions = torch.tensor(transition_dict['actions'],
-                               dtype=torch.float).to(self.device)
+        actions = torch.tensor(transition_dict['actions']).view(-1, 1).to(
+            self.device)
         rewards = torch.tensor(transition_dict['rewards'],
                                dtype=torch.float).view(-1, 1).to(self.device)
         next_states = torch.tensor(transition_dict['next_states'],
                                    dtype=torch.float).to(self.device)
         dones = torch.tensor(transition_dict['dones'],
                              dtype=torch.float).view(-1, 1).to(self.device)
-        # 添加奖励缩放
-        rewards = (rewards + 8.0) / 8.0  # 和TRPO一样,对奖励进行修改,方便训练
-
-        td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)  # 时序差分回报值
-        td_delta = td_target - self.critic(states)  # 优势函数用时序差分回报与Critic网络输出作差表示
-        advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
-
-        mu, std = self.actor(states)  # 均值、方差
-
-        # 添加NaN检查
-        if torch.isnan(mu).any() or torch.isnan(std).any():
-            print("WARNING: NaN detected in mu or std!")
-            print(f"mu: {mu}\nstd: {std}")
-            raise ValueError("NaN in actor network outputs")
-
-        action_dists = torch.distributions.Normal(mu.detach(), std.detach())
-        # 动作是正态分布
-        old_log_probs = action_dists.log_prob(actions)
+        td_target = rewards + self.gamma * self.critic(next_states) * (1 -
+                                                                       dones)
+        td_delta = td_target - self.critic(states)
+        advantage = compute_advantage(self.gamma, self.lmbda,
+                                               td_delta.cpu()).to(self.device)
+        old_log_probs = torch.log(self.actor(states).gather(1,
+                                                            actions)).detach()
 
         for _ in range(self.epochs):
-            mu, std = self.actor(states)
-
-            # 添加循环内的NaN检查
-            if torch.isnan(mu).any() or torch.isnan(std).any():
-                print("WARNING: NaN detected in mu or std during training!")
-                print(f"mu: {mu}\nstd: {std}")
-                raise ValueError("NaN in actor network outputs during training")
-
-            action_dists = torch.distributions.Normal(mu, std)
-            log_probs = action_dists.log_prob(actions)
+            log_probs = torch.log(self.actor(states).gather(1, actions))
             ratio = torch.exp(log_probs - old_log_probs)
-
-            # # 添加KL检查
-            # approx_kl = (old_log_probs - log_probs).mean()
-            # test = 0.02
-            # if abs(approx_kl) > test:
-            #     # print('approx_kl',approx_kl) # 这个好像绝对值大于1就会有问题
-            #     ratio = torch.exp((log_probs - old_log_probs) / abs(approx_kl) * test)
-            #     # print('ratio', ratio)  # 这个好像绝对值大于1就会有问题
-
             surr1 = ratio * advantage
-            surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage  # 截断
-            actor_loss = torch.mean(-torch.min(surr1, surr2))
-            critic_loss = torch.mean(
+            surr2 = torch.clamp(ratio, 1 - self.eps,      # torch.clamp(x,min,max)裁剪
+                                1 + self.eps) * advantage  # 截断
+            actor_loss = torch.mean(-torch.min(surr1, surr2))  # PPO损失函数，Actor的损失函数
+            critic_loss = torch.mean( # PPO Critic损失函数
                 F.mse_loss(self.critic(states), td_target.detach()))
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
             actor_loss.backward()
             critic_loss.backward()
-
-            # # 梯度裁剪
-            # nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=2)
-            # nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=2)
-
             self.actor_optimizer.step()
             self.critic_optimizer.step()
-
-
 # 超参数
-actor_lr = 1e-4 # 1e-4
-critic_lr = 5e-3 # 5e-3
-num_episodes = 2000  # 2000
-hidden_dim = [120]  # 128
-gamma = 0.9
-lmbda = 0.9
+actor_lr = 1e-3
+critic_lr = 1e-2
+num_episodes = 500
+hidden_dim = [128]
+gamma = 0.98
+lmbda = 0.95
 epochs = 10
 eps = 0.2
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
-env_name = 'Pendulum-v1'
+env_name = 'CartPole-v0'
 env = gym.make(env_name)
 env.seed(0)
 torch.manual_seed(0)
 state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.shape[0]  # 连续动作空间
-agent = PPOContinuous(state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
-                      lmbda, epochs, eps, gamma, device)
+action_dim = env.action_space.n
+agent = PPO_discrete(state_dim, hidden_dim, action_dim, actor_lr, critic_lr, lmbda,
+                     epochs, eps, gamma, device)
 
-# def train_on_policy_agent(env, agent, num_episodes):
 return_list = []
 for i in range(10):
     with tqdm(total=int(num_episodes/10), desc='Iteration %d' % i) as pbar:
@@ -206,7 +166,7 @@ for i in range(10):
             state = env.reset()
             done = False
             while not done:
-                action = agent.take_action(state, action_bound=2.0)
+                action = agent.take_action(state)
                 next_state, reward, done, _ = env.step(action)
                 transition_dict['states'].append(state)
                 transition_dict['actions'].append(action)
@@ -229,7 +189,7 @@ plt.ylabel('Returns')
 plt.title('PPO on {}'.format(env_name))
 plt.show()
 
-mv_return = moving_average(return_list, 17)  # 21
+mv_return = moving_average(return_list, 9)
 plt.plot(episodes_list, mv_return)
 plt.xlabel('Episodes')
 plt.ylabel('Returns')
