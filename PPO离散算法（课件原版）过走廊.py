@@ -531,26 +531,26 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
 
 # return_list = train_off_policy_agent(env, agent, num_episodes, replay_buffer, minimal_size, batch_size)
 
-if 1 or not stop_flag:
-    episodes_list = list(range(len(return_list)))
-    plt.figure()
-    plt.plot(episodes_list, return_list)
-    plt.xlabel('Episodes')
-    plt.ylabel('Returns')
-    plt.title('SAC on {}'.format(env_name))
 
-    mv_return = moving_average(return_list, 9)
-    plt.figure()
-    plt.plot(episodes_list, mv_return)
-    plt.xlabel('Episodes')
-    plt.ylabel('Returns')
-    plt.title('SAC on {}'.format(env_name))
+episodes_list = list(range(len(return_list)))
+plt.figure()
+plt.plot(episodes_list, return_list)
+plt.xlabel('Episodes')
+plt.ylabel('Returns')
+plt.title('PPO on {}'.format(env_name))
 
-    plt.figure()
-    plt.plot(steps_list, return_list)
-    plt.xlabel('steps')
-    plt.ylabel('Returns')
-    plt.title('SAC on {}'.format(env_name))
+mv_return = moving_average(return_list, 21)
+plt.figure()
+plt.plot(episodes_list, mv_return)
+plt.xlabel('Episodes')
+plt.ylabel('Returns')
+plt.title('PPO on {}'.format(env_name))
+
+plt.figure()
+plt.plot(steps_list, return_list)
+plt.xlabel('steps')
+plt.ylabel('Returns')
+plt.title('PPO on {}'.format(env_name))
 
 car_trajectory = []
 target_trajectory = []
