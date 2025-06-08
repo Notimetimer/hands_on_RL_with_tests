@@ -131,10 +131,11 @@ class PPO_discrete:
             critic_loss.backward()
             self.actor_optimizer.step()
             self.critic_optimizer.step()
+
 # 超参数
 actor_lr = 1e-3
 critic_lr = 1e-2
-num_episodes = 500
+num_episodes = 200 # 500
 hidden_dim = [128]
 gamma = 0.98
 lmbda = 0.95

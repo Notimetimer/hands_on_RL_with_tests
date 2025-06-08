@@ -25,8 +25,8 @@ stop_flag = False  # 控制退出的全局变量
 # import rl_utils
 dt = 0.1
 # dof = 3
-actor_lr = 1e-3
-critic_lr = 1e-2
+actor_lr = 1e-3 /10
+critic_lr = 1e-2 /10
 num_episodes = 420*5  # 800 400
 hidden_dim = 128
 
