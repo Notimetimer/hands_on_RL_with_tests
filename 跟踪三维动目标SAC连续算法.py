@@ -11,9 +11,10 @@ import matplotlib
 
 matplotlib.use('Qt5Agg')  # 使用Qt5作为后端
 from gym import spaces
+from numpy.linalg import norm
 from torch.distributions import Normal
 
-# import rl_utils
+# 超参数
 dt = 0.5
 dof = 3
 actor_lr = 3e-4
@@ -108,7 +109,7 @@ class PolicyNetContinuous(torch.nn.Module):
 class QValueNetContinuous(torch.nn.Module):
     def __init__(self, state_dim, hidden_dim, action_dim):
         super(QValueNetContinuous, self).__init__()
-        self.action_bound = action_bound
+        # self.action_bound = action_bound
         self.prelu1 = torch.nn.PReLU()
         self.action_dim = action_dim
         layers = []
@@ -266,79 +267,12 @@ class SACContinuous:
         self.soft_update(self.critic_1, self.target_critic_1)
         self.soft_update(self.critic_2, self.target_critic_2)
 
-
-# 更改目标：跟踪动目标
-class testEnv(gym.Env):
-    def __init__(self):
-        super(testEnv, self).__init__()
-        # 观测空间：相对于点的位置和速度
-        low1 = np.ones(dof * 2) * -np.inf
-        high1 = np.ones(dof * 2) * np.inf
-        self.observation_space = spaces.Box(low=low1, high=high1, dtype=np.float32)
-        # 动作空间：三轴加速度
-        self.action_space = spaces.Box(low=-5, high=5, shape=(dof,), dtype=np.float32)
-        self.state = None
-        self.done = False
-        self.target_vel_ = None
-        self.target_pos_ = None
-        self.t = None
-
-    def reset(self, train=True):
-        # 初始化状态
-        self.t = 0
-        self.target_pos_ = np.zeros(dof)
-        self.target_vel_ = np.ones(dof)
-
-        if train:
-            pos_ = np.random.rand(dof) * 3
-            vel_ = np.random.rand(dof) * 0.3
-        else:
-            pos_ = np.ones(dof)
-            vel_ = np.ones(dof) * 0.1
-        self.state = np.hstack((pos_, vel_))  # 初始位置
-        self.done = False
-        observe = self.state
-        return observe
-
-    def step(self, action):
-        self.t += dt
-        pos_ = self.state[0:dof]  # 从数组中提取向量
-        vel_ = self.state[dof:]
-
-        # # # 更新状态
-        vel_ += action * dt
-        pos_ += vel_ * dt
-        self.target_pos_ += self.target_vel_ * dt
-
-        self.state = np.hstack((pos_, vel_))
-        observe = np.hstack((self.target_pos_ - pos_, self.target_vel_ - vel_))
-
-        # 定义奖励函数
-        reward = 2 * (5 - np.linalg.norm(observe[0:dof]))  # 奖励与位置偏差的绝对值成负正比
-
-        # reward_plus = -reward**2 * 5
-        # reward_plus -= np.linalg.norm(observe[dof:])**2
-
-        # reward_plus = min(0, -np.linalg.norm(np.dot(vel_, pos_)/np.linalg.norm(pos_))) if np.linalg.norm(pos_) > 0 else -np.linalg.norm(vel_)
-
-        if self.t > 20:
-            self.done = True
-        if np.linalg.norm(observe[0:dof]) > 10:
-            reward -= 100
-            self.done = True
-
-        reward_plus = 0
-        return observe, reward, self.done, reward_plus
-
-    def render(self, mode='human'):
-        # 可视化小车的位置和方向
-        pass
-
+from tracking_test import testEnv
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
 env_name = 'testEnv'
-env = testEnv()
+env = testEnv(dof=dof, dt=dt)
 random.seed(0)
 np.random.seed(0)
 # env.seed(0)
@@ -357,12 +291,12 @@ agent = SACContinuous(state_dim, hidden_dim_1, action_dim, action_bound,
 # def train_off_policy_agent(env, agent, num_episodes, replay_buffer, minimal_size, batch_size):
 return_list = []
 # global state_check
-for i in range(10):  # 10
-    with tqdm(total=int(num_episodes / 10), desc='Iteration %d' % i) as pbar:  # 进度条
-        for i_episode in range(int(num_episodes / 10)):  # 每个1/10的训练轮次
+# for i in range(1):  # 10
+with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
+    for i_episode in range(int(num_episodes)):  # 每个1/10的训练轮次
             episode_return = 0
             # state = env.reset(train=True)
-            state = env.reset(train=False)
+            state = env.reset(train=True)
             done = False
             while not done:  # 每个训练回合
                 # state_check=state
@@ -387,8 +321,8 @@ for i in range(10):  # 10
                     agent.update(transition_dict)
             episode_return = np.clip(episode_return, -1000, 1000)  # 不这样都没法看
             return_list.append(episode_return)
-            if (i_episode + 1) % 10 == 0:
-                pbar.set_postfix({'episode': '%d' % (num_episodes / 10 * i + i_episode + 1),
+            if (i_episode + 1) >= 10:
+                pbar.set_postfix({'episode': '%d' % (i_episode + 1),
                                   'return': '%.3f' % np.mean(return_list[-10:])})
             pbar.update(1)
     # return return_list
@@ -422,12 +356,6 @@ while not done:  # 测试回合
     target_trajectory.append(env.target_pos_[0:dof].copy())
     state = next_state
     episode_return += reward
-
-    if episode_return > 200:
-        # print("episode_return",episode_return)
-        # print("distance",np.linalg.norm(next_state[0:dof]))
-        # print("time", env.t)
-        pass
 
 # 新增代码：绘制每个坐标分量的轨迹和目标值
 plt.figure(4)
