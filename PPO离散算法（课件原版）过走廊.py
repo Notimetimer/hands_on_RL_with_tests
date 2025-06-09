@@ -459,8 +459,8 @@ action_bound = env.action_space.high[0]  # 动作最大值，
 ###### 当把连续空间适配离散动作空间时action_dim不能跟着env走 ######
 action_list = np.array([
     # [0, 0],
-    # [0, 1],  # 上
-    # [0, -1],  # 下
+    [0, 1],  # 上
+    [0, -1],  # 下
     [-1, 0],  # 左
     [1, 0]  # 右
 ]) * action_bound
