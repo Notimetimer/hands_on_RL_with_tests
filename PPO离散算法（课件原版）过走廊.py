@@ -155,7 +155,7 @@ class PPO_discrete:
             self.critic_optimizer.step()
 
 def moving_average(a, window_size):
-    cumulative_sum = np.cumsum(np.insert(a, 0, 0))
+    cumulative_sum = np.cumsum(np.insert(a, 0, 0)) # np.insert(a, 0, 0) 在数组 a 的位置0（第二项）插入一个 0(第三项），cumsum是计算累积和
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
     r = np.arange(1, window_size - 1, 2)
     begin = np.cumsum(a[:window_size - 1])[::2] / r
@@ -549,6 +549,13 @@ plt.title('PPO on {}'.format(env_name))
 plt.figure()
 plt.plot(steps_list, return_list)
 plt.xlabel('steps')
+plt.ylabel('Returns')
+plt.title('PPO on {}'.format(env_name))
+
+steps_return = moving_average(return_list, 21)
+plt.figure()
+plt.plot(steps_list, steps_return)
+plt.xlabel('Episodes')
 plt.ylabel('Returns')
 plt.title('PPO on {}'.format(env_name))
 
