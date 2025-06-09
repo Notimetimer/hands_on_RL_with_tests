@@ -92,14 +92,18 @@ class PolicyNetContinuous(nn.Module):
         self.net = nn.Sequential(*layers)
         self.fc_mu = nn.Linear(prev_size, action_dim)
         self.fc_log_std = nn.Linear(prev_size, action_dim)
+        # self.fc_std = torch.nn.Linear(prev_size, action_dim)
+
         nn.init.xavier_normal_(self.fc_mu.weight, gain=0.01)
         nn.init.xavier_normal_(self.fc_log_std.weight, gain=0.01)
+        # nn.init.xavier_normal_(self.fc_std.weight, gain=0.01)
 
     def forward(self, x):
         x = self.net(x)
         mu = self.fc_mu(x)
         log_std = self.fc_log_std(x).clamp(-5, 2)  # 限制 log_std 范围防止过小/大
         std = torch.exp(log_std)
+        # std = F.softplus(self.fc_std(x))  # + 1e-8
         return mu, std
 
 class PPOContinuous:
@@ -135,9 +139,9 @@ class PPOContinuous:
         # 标准化奖励（可选）
         rewards = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
 
-        td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
-        td_delta = td_target - self.critic(states)
-        advantage = compute_advantage(self.gamma, self.lmbda, td_delta).to(self.device)
+        td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)  # 时序差分回报值
+        td_delta = td_target - self.critic(states)  # 优势函数用时序差分回报与Critic网络输出作差表示
+        advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
 
         # 标准化优势
         advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)

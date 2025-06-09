@@ -18,7 +18,7 @@ def moving_average(a, window_size):
     return np.concatenate((begin, middle, end))
 
 def compute_advantage(gamma, lmbda, td_delta):
-    td_delta = td_delta.detach().numpy()
+    td_delta = td_delta.detach().cpu().numpy()
     advantage_list = []
     advantage = 0.0
     for delta in td_delta[::-1]:
@@ -55,8 +55,7 @@ class ValueNet(torch.nn.Module):
 class PolicyNetContinuous(torch.nn.Module):
     def __init__(self, state_dim, hidden_dim, action_dim):
         super(PolicyNetContinuous, self).__init__()
-        self.prelu = torch.nn.PReLU()
-        self.action_dim = action_dim
+        # self.prelu = torch.nn.PReLU()
         layers = []
         prev_size = state_dim
         for layer_size in hidden_dim:
@@ -77,19 +76,15 @@ class PolicyNetContinuous(torch.nn.Module):
         std = F.softplus(self.fc_std(x)) #  + 1e-8
         return mu, std
 
-
-
 class PPOContinuous:
     ''' 处理连续动作的PPO算法 '''
     def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
                  lmbda, epochs, eps, gamma, device):
-        self.actor = PolicyNetContinuous(state_dim, hidden_dim,
-                                         action_dim).to(device)
+        self.actor = PolicyNetContinuous(state_dim, hidden_dim, action_dim).to(device)
         self.critic = ValueNet(state_dim, hidden_dim).to(device)
-        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(),
-                                                lr=actor_lr)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(),
-                                                 lr=critic_lr)
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
+
         self.gamma = gamma
         self.lmbda = lmbda
         self.epochs = epochs
