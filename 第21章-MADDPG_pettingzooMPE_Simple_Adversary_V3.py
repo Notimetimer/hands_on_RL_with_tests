@@ -27,7 +27,8 @@ Transition = namedtuple('Transition', ('state', 'action', 'reward', 'next_state'
 class ReplayBuffer:
     """ReplayBuffer is a class used to achieve experience replay.
 
-    It's a buffer composed of a deque with a certain capacity. When the deque is full, it will automatically remove the oldest transition in the buffer.
+    It's a buffer composed of a deque with a certain capacity. When the deque is full
+    , it will automatically remove the oldest transition in the buffer.
 
     Attributes:
         _storage: The buffer to store the transitions.
@@ -192,7 +193,7 @@ class DDPG:
         # Set Critic with Target Network
         # 目标actor和critic更新的频率如何？
         # 参见train部分，每当Buffer规模达到最小限制且整除update_interval之后会一同更新所有网络
-        self.critic = SimpleNet(critic_dim, 1, hidden_dim).to(device) # 只输出一个值的评价
+        self.critic = SimpleNet(critic_dim, 1, hidden_dim).to(device) # 只输出一个值的评价, 因为是每个智能体专属的
         self.target_critic = SimpleNet(critic_dim, 1, hidden_dim).to(device)
         # Load parameters from Actor and Critic to their target networks
         self.target_actor.load_state_dict(self.actor.state_dict())
@@ -377,19 +378,18 @@ class MADDPG:
         target_critic_value = (rewards[agent_idx].view(-1, 1) +
                                self.gamma * current_agent.target_critic(target_critic_input) *
                                (1 - dones[agent_idx].view(-1, 1)))
-        critic_input = torch.cat((*states, *actions), dim=1) # todo 这里给critic输入的究竟是所有agent的状态-动作还是局部的？
+        critic_input = torch.cat((*states, *actions), dim=1)  # 这里给critic输入的是所有agent的状态-动作
         critic_value = current_agent.critic(critic_input)
         critic_loss = self.critic_criterion(critic_value, target_critic_value.detach())
-        # 为啥detach之后还能反向传播？kimi的回答是：评价网络的梯度仍然可以反向传播而更新，而目标评价网络因为detach所以不会更新
         critic_loss.backward()
         current_agent.critic_optimizer.step()
         # Update Current Actor (Policy Network) with Deep Deterministic Policy Gradient
-        current_agent.actor_optimizer.zero_grad() # pytorch等框架的问题，不会替换旧的梯度而是会累积，需要的是当前的梯度值
+        current_agent.actor_optimizer.zero_grad()  # pytorch等框架的问题，不会替换旧的梯度而是会累积，需要的是当前的梯度值
         current_actor_action_value = current_agent.actor(states[agent_idx])
         current_actor_action_onehot = gumbel_softmax(current_actor_action_value)
         all_actor_actions = [
-            current_actor_action_onehot if i == agent_idx else trans2onehot(_policy(_state)) # todo 这段是什么意思？谁探索策略谁用现有最优？
-            for i, (_policy, _state) in enumerate(zip(self.policies, states))
+            current_actor_action_onehot if i == agent_idx else trans2onehot(_policy(_state))  # 一次只给一个智能体用探索动作，其他只是策略利用作为环境的一部分
+            for i, (_policy, _state) in enumerate(zip(self.policies, states))  # 对应提取zip里面的两个元素
         ]
         current_critic_input = torch.cat((*states, *all_actor_actions), dim=1) # todo 这里给critic输入的究竟是所有agent的状态-动作还是局部的？
         actor_loss = (-current_agent.critic(current_critic_input).mean() +
