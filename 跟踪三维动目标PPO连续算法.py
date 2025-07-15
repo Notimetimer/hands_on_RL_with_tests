@@ -138,8 +138,8 @@ class PPOContinuous:
                                    dtype=torch.float).to(self.device)
         dones = torch.tensor(transition_dict['dones'],
                              dtype=torch.float).view(-1, 1).to(self.device)
-        # 添加奖励缩放
-        rewards = (rewards + 8.0) / 8.0  # 和TRPO一样,对奖励进行修改,方便训练
+        # # 添加奖励缩放
+        # rewards = (rewards + 8.0) / 8.0  # 和TRPO一样,对奖励进行修改,方便训练
 
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)  # 时序差分回报值
         td_delta = td_target - self.critic(states)  # 优势函数用时序差分回报与Critic网络输出作差表示
@@ -170,6 +170,8 @@ class PPOContinuous:
             log_probs = action_dists.log_prob(actions)
             ratio = torch.exp(log_probs - old_log_probs)
 
+            # print(ratio)
+
             # # 添加KL检查
             # approx_kl = (old_log_probs - log_probs).mean()
             # test = 0.02
@@ -180,7 +182,11 @@ class PPOContinuous:
 
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage  # 截断
-            actor_loss = torch.mean(-torch.min(surr1, surr2))
+            # actor_loss = torch.mean(-torch.min(surr1, surr2)) # original
+            actor_loss = torch.sum(torch.min(surr1,surr2),dim=-1,keepdim=True) # test
+            # print(actor_loss)
+            actor_loss = -actor_loss.mean()
+
             critic_loss = torch.mean(
                 F.mse_loss(self.critic(states), td_target.detach()))
             self.actor_optimizer.zero_grad()

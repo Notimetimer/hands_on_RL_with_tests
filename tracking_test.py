@@ -64,10 +64,11 @@ class testEnv(gym.Env):
         if self.t > 20:
             self.done = True
         if np.linalg.norm(observe[0:self.dof]) > 10:
-            reward -= 100
+            reward -= 30  # 100
             self.done = True
 
         reward_plus = 0
+        # reward = (reward + 10) / 10
         return observe, reward, self.done, reward_plus
 
     def render(self, mode='human'):
