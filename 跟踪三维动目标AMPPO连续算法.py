@@ -31,7 +31,7 @@ eps = 0.2
 # AM超参数
 tau_A = 1.25
 p_star_A = 0.1
-k_shared = 2 / 1.5
+k_shared = 2  # 2 / 1.5
 ita_A = 0.3
 rau_A = 0.1
 epsilon_A = 10 ** -5
@@ -157,8 +157,6 @@ class PPOContinuous:
                                    dtype=torch.float).to(self.device)
         dones = torch.tensor(transition_dict['dones'],
                              dtype=torch.float).view(-1, 1).to(self.device)
-        # # 添加奖励缩放
-        # rewards = (rewards + 8.0) / 8.0  # 和TRPO一样,对奖励进行修改,方便训练
 
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)  # 时序差分回报值
         td_delta = td_target - self.critic(states)  # 优势函数用时序差分回报与Critic网络输出作差表示
@@ -171,7 +169,7 @@ class PPOContinuous:
         Z_A_mb = alpha_A_current * A_hat_mb
         A_mod_mb = abs(advantage) * (k_shared * torch.tanh(Z_A_mb))
         alpha_A_hat = k_shared * (N_Amb + epsilon_A) / sigma_A_mb * (
-                    p_star_A / (self.s_prev_A_ema + epsilon_A)) ** ita_A
+                p_star_A / (self.s_prev_A_ema + epsilon_A)) ** ita_A
         self.alpha_A_ema = np.clip((1 - rau_A) * self.alpha_A_ema + rau_A * alpha_A_hat, alpha_minA, alpha_maxA)
         # print(Z_A_mb)
         temp = torch.abs(Z_A_mb) > tau_A
@@ -181,15 +179,24 @@ class PPOContinuous:
         self.s_prev_A_ema = (1 - rau_sat_A) * self.s_prev_A_ema + rau_sat_A * s_curr_A
 
         advantage = A_mod_mb  # 塑形后优势度函数
+        # print(A_mod_mb)
         # s_curr_A=
 
         mu, std = self.actor(states)  # 均值、方差
+        critic_values = self.critic(states)
+        old_critic_values = critic_values.detach().clone()
+        v_target_mb = A_mod_mb + old_critic_values
 
-        # 添加NaN检查
+        # 添加Actor NaN检查
         if torch.isnan(mu).any() or torch.isnan(std).any():
             print("WARNING: NaN detected in mu or std!")
-            print(f"mu: {mu}\nstd: {std}")
+            # print(f"mu: {mu}\nstd: {std}")
             raise ValueError("NaN in actor network outputs")
+        # 添加Critic NaN检查
+        if torch.isnan(critic_values).any():
+            print("WARNING: NaN detected in critic values!")
+            # print(f"critic_values: {critic_values}")
+            raise ValueError("NaN in critic network outputs")
 
         action_dists = torch.distributions.Normal(mu.detach(), std.detach())
         # 动作是正态分布
@@ -197,12 +204,18 @@ class PPOContinuous:
 
         for _ in range(self.epochs):
             mu, std = self.actor(states)
+            critic_values = self.critic(states)
 
-            # 添加循环内的NaN检查
+            # 添加Actor NaN检查
             if torch.isnan(mu).any() or torch.isnan(std).any():
-                print("WARNING: NaN detected in mu or std during training!")
-                print(f"mu: {mu}\nstd: {std}")
-                raise ValueError("NaN in actor network outputs during training")
+                print("WARNING: NaN detected in mu or std!")
+                # print(f"mu: {mu}\nstd: {std}")
+                raise ValueError("NaN in actor network outputs")
+            # 添加Critic NaN检查
+            if torch.isnan(critic_values).any():
+                print("WARNING: NaN detected in critic values!")
+                # print(f"critic_values: {critic_values}")
+                raise ValueError("NaN in critic network outputs")
 
             action_dists = torch.distributions.Normal(mu, std)
             log_probs = action_dists.log_prob(actions)
@@ -219,21 +232,30 @@ class PPOContinuous:
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage  # 截断
             actor_loss = torch.mean(-torch.min(surr1, surr2))
-            critic_loss = torch.mean(
-                F.mse_loss(self.critic(states), td_target.detach()))  # original
-            # critic_loss = torch.max(F.mse_loss(self.critic(states), td_target.detach()),
-            #                         self.critic(states)+clip()
-            #                         )
+            critic_loss = F.mse_loss(self.critic(states), td_target.detach())  # original
+            # print('原有CriticLoss',critic_loss)
+
+            # critic_loss = torch.max(F.mse_loss(self.critic(states), v_target_mb),
+            #                         F.mse_loss(old_critic_values + torch.clamp(self.critic(states) - old_critic_values,
+            #                                                                    -self.eps, self.eps), v_target_mb)
+            #                         )  # test 1
+            # critic_loss = torch.mean(
+            #     torch.max((self.critic(states) - v_target_mb)**2,
+            #               (old_critic_values + torch.clamp(self.critic(states) - old_critic_values, -self.eps,
+            #                                                          self.eps) - v_target_mb)**2
+            #               ))  # test 2
+            # print('新的CriticLoss',critic_loss)
 
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
-            actor_loss.backward()
+            actor_loss.backward()  # original
             critic_loss.backward()
+            # total_loss = actor_loss + critic_loss # test
+            # total_loss.backward()
 
-            # # 梯度裁剪
-            # nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=2)
-            # nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=2)
-
+            # test 梯度裁剪
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=0.5)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=0.5)
             self.actor_optimizer.step()
             self.critic_optimizer.step()
 
