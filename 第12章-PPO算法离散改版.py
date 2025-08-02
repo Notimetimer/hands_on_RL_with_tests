@@ -1,3 +1,5 @@
+# 相比书籍原版，新增了列表定义多层神经网络形状的方法
+
 import gym
 import torch
 import torch.nn.functional as F
