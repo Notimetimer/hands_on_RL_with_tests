@@ -28,7 +28,6 @@ lmbda = 0.9
 epochs = 10  # 10
 eps = 0.2
 
-
 def moving_average(a, window_size):
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size

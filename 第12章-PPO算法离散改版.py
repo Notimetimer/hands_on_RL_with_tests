@@ -104,7 +104,11 @@ class PPO_discrete:
                               dtype=torch.float).to(self.device)
         actions = torch.tensor(transition_dict['actions']).view(-1, 1).to(
             self.device)
-        rewards = torch.tensor(transition_dict['rewards'],
+        
+        # test 时间平滑奖励， 过于鸡肋只是绊脚石
+        rewards_temp = np.array(transition_dict['rewards'])
+        rewards_temp = moving_average(rewards_temp, window_size=3)
+        rewards = torch.tensor(rewards_temp,  # transition_dict['rewards'],
                                dtype=torch.float).view(-1, 1).to(self.device)
         next_states = torch.tensor(transition_dict['next_states'],
                                    dtype=torch.float).to(self.device)
