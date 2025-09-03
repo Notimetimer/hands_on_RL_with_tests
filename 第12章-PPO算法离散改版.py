@@ -119,11 +119,14 @@ class PPO_discrete:
         td_delta = td_target - self.critic(states)
         advantage = compute_advantage(self.gamma, self.lmbda,
                                                td_delta.cpu()).to(self.device)
+        
+        # print("actions",self.actor(states))
+        # print("gather",self.actor(states).gather(1, actions))
         old_log_probs = torch.log(self.actor(states).gather(1,
                                                             actions)).detach()
 
         for _ in range(self.epochs):
-            log_probs = torch.log(self.actor(states).gather(1, actions))
+            log_probs = torch.log(self.actor(states).gather(1, actions)) # 从actor输出序列中的每一行抽取编号为actions同行的动作
             ratio = torch.exp(log_probs - old_log_probs)
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps,      # torch.clamp(x,min,max)裁剪
