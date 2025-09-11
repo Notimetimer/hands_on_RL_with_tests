@@ -128,33 +128,10 @@ class PPOContinuous:
         self.epochs = epochs
         self.eps = eps
         self.device = device
-        # self.has_continuous_action_space = 1
-        # if self.has_continuous_action_space:
-        #     self.action_dim = action_dim
-        #     self.action_var = torch.full((action_dim,), action_std_init * action_std_init).to(device)
-
-    # def evaluate(self, state, action):
-    #
-    #     if self.has_continuous_action_space:
-    #         action_mean = self.actor(state)
-    #
-    #         action_var = self.action_var.expand_as(action_mean)
-    #         cov_mat = torch.diag_embed(action_var).to(device)
-    #         dist = MultivariateNormal(action_mean, cov_mat)
-    #
-    #         # For Single Action Environments.
-    #         if self.action_dim == 1:
-    #             action = action.reshape(-1, self.action_dim)
-    #         else:
-    #             action_probs = self.actor(state)
-    #             dist = Categorical(action_probs)
-    #         action_logprobs = dist.log_prob(action)
-    #         dist_entropy = dist.entropy()
-    #         state_values = self.critic(state)
-    #         return action_logprobs, state_values, dist_entropy
+        
     def take_action(self, state, action_bound=2.0, explore=True):
         # 记录当前网络版本
-        print(f"Network version in take_action: {self.network_version}")
+        # print(f"Network version in take_action: {self.network_version}")
 
         state = torch.tensor([state], dtype=torch.float).to(self.device)
         with torch.no_grad():
@@ -178,8 +155,6 @@ class PPOContinuous:
                                dtype=torch.float).to(self.device)
         rewards = torch.tensor(replay_buffer['rewards'],
                                dtype=torch.float).view(-1, 1).to(self.device)
-        # next_states = torch.tensor(replay_buffer['next_states'],
-        #                            dtype=torch.float).to(self.device)
         dones = torch.tensor(replay_buffer['dones'],
                              dtype=torch.float).view(-1, 1).to(self.device)
 
@@ -194,40 +169,18 @@ class PPOContinuous:
         td_target = rewards + self.gamma * next_values * (1 - dones)  # 时序差分回报值
         td_delta = td_target - values  # 优势函数用时序差分回报与Critic网络输出作差表示
         advantage1 = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
-
-        # td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)  # 时序差分回报值
-        # td_delta = td_target - self.critic(states)  # 优势函数用时序差分回报与Critic网络输出作差表示
-        # advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
-
-        # # 比较两种方式差异
-        # print('advantage1', torch.abs(advantage1.detach() - advantage.detach()).mean())
         advantage = advantage1
-
-        # mu, std = self.actor(states, action_bound=action_bound)  # 均值、方差
-        # action_dists = torch.distributions.Normal(mu.detach(), std.detach())
-        # old_log_probs_orig = action_dists.log_prob(actions)
-        # print('old_log_probs', torch.abs(old_log_probs1 - old_log_probs_orig.detach()).sum())
-        # print('mu', torch.abs(mu - mu_recorded).sum())
-        # print('std', torch.abs(std - std_recorded).sum())
-        # old_log_probs = old_log_probs_orig
         old_log_probs = old_log_probs1
 
         for _ in range(self.epochs):
-            # # test
-            # logprobs, state_values, dist_entropy = self.evaluate(old_states, old_actions)
-
             mu, std = self.actor(states, action_bound=action_bound)
             critic_values = self.critic(states)
 
             # 添加Actor NaN检查
             if torch.isnan(mu).any() or torch.isnan(std).any():
-                print("WARNING: NaN detected in mu or std!")
-                # print(f"mu: {mu}\nstd: {std}")
                 raise ValueError("NaN in actor network outputs")
             # 添加Critic NaN检查
             if torch.isnan(critic_values).any():
-                print("WARNING: NaN detected in critic values!")
-                # print(f"critic_values: {critic_values}")
                 raise ValueError("NaN in critic network outputs")
 
             action_dists = torch.distributions.Normal(mu, std)
@@ -265,9 +218,9 @@ class PPOContinuous:
             self.optimizer.step()
 
             # 标记网络更新
-            print(f"Network version before update: {self.network_version}")
+            # print(f"Network version before update: {self.network_version}")
             self.network_version += 1  # 更新版本号
-            print(f"Network version after update: {self.network_version}")
+            # print(f"Network version after update: {self.network_version}")
 
 
 from tracking_test import testEnv
@@ -318,7 +271,6 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
 
             replay_buffer['states'].append(state)
             replay_buffer['actions'].append(action)
-            # replay_buffer['next_states'].append(next_state)
 
             action_dist = torch.distributions.Normal(copy.deepcopy(agent.action_mu), copy.deepcopy(agent.action_std))
             old_log_prob = action_dist.log_prob(torch.tensor(action, dtype=torch.float).to(device))

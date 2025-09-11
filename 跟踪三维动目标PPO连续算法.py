@@ -160,6 +160,8 @@ class PPOContinuous:
         # 动作是正态分布
         old_log_probs = action_dists.log_prob(actions)
 
+        # print(old_log_probs.shape)
+
         for _ in range(self.epochs):
             mu, std = self.actor(states, action_bound=action_bound)
             critic_values = self.critic(states)

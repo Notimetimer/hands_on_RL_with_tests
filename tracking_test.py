@@ -22,12 +22,14 @@ class testEnv(gym.Env):
         self.target_vel_ = None
         self.target_pos_ = None
         self.t = None
+        self.out_range = None
 
     def reset(self, train=True):
         # 初始化状态
         self.t = 0
         self.target_pos_ = np.zeros(self.dof)
         self.target_vel_ = np.ones(self.dof)
+        self.out_range = 0
 
         if train:
             pos_ = np.random.rand(self.dof) * 3
@@ -64,6 +66,7 @@ class testEnv(gym.Env):
         if self.t > 20:
             self.done = True
         if np.linalg.norm(observe[0:self.dof]) > 10:
+            self.out_range = 1
             reward -= 30  # 100
             self.done = True
 
