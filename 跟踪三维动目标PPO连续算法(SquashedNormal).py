@@ -363,7 +363,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
             # state_check=state
             # 1.执行动作得到环境反馈
             action = agent.take_action(state, action_bounds=action_bound, explore=True)
-            next_state, reward, done, reward_plus = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
+            next_state, reward, done, reward_plus = env.step(action)
             transition_dict['states'].append(state)
             transition_dict['actions'].append(action)
             transition_dict['next_states'].append(next_state)
