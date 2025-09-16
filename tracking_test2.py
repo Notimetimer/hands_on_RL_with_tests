@@ -13,7 +13,7 @@ class testEnv(gymn.Env):
         self.dt = dt
         low1 = np.ones(self.dof * 2) * -np.inf
         high1 = np.ones(self.dof * 2) * np.inf
-        self.observation_space = gymn.spaces.Box(low=low1, high=high1, dtype=np.float32)
+        self.observation_space = gymn.spaces.Box(low=low1.astype(np.float32), high=high1.astype(np.float32), dtype=np.float32)
         self.action_space = gymn.spaces.Box(low=-5.0, high=5.0, shape=(self.dof,), dtype=np.float32)
         self.state = None
         self.done = False

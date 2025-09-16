@@ -1,34 +1,9 @@
-import random
-import gymnasium as gymn
+from torch.distributions import Normal
 import numpy as np
-from tqdm import tqdm
-import collections
 import torch
 from torch import nn
 import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import matplotlib
 
-matplotlib.use('Qt5Agg')
-from numpy.linalg import norm
-from torch.distributions import Normal
-
-# import rl_utils
-dt = 0.5
-dof = 3
-
-# 超参数
-actor_lr = 1e-3 /10 # 1e-4 1e-6  # 2e-5 警告，学习率过大会出现"nan"
-critic_lr = actor_lr * 10  # 1e-3  9e-3  5e-3 为什么critic学习率大于一都不会梯度爆炸？ 为什么设置成1e-5 也会爆炸？ chatgpt说要actor的2~10倍
-num_episodes = 500  # 2000
-hidden_dim = [128]  # 128
-gamma = 0.9
-lmbda = 0.9
-epochs = 10  # 10
-eps = 0.2
-
-
-# 改进算法
 
 def moving_average(a, window_size):
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
@@ -126,7 +101,7 @@ class PolicyNetContinuous(torch.nn.Module):
         self.fc_mu = torch.nn.Linear(prev_size, action_dim)
         self.fc_std = torch.nn.Linear(prev_size, action_dim)
 
-    def forward(self, x, min_std=1e-3):
+    def forward(self, x, min_std=1e-7): # 最小方差 1e-3
         x = self.net(x)
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x))
@@ -316,155 +291,16 @@ class PPOContinuous:
             self.critic_optimizer.step()
 
 
-from tracking_test2 import testEnv
-
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-env_name = 'testEnv'
-# 并行环境数量
-num_envs = 4
-random.seed(0)
-np.random.seed(0)
-torch.manual_seed(0)
-
-state_dim = testEnv(dof=3, dt=0.5).observation_space.shape[0]
-action_dim = testEnv(dof=3, dt=0.5).action_space.shape[0]
-
-# 全局动作区间（每个维度相同）
-single_env = testEnv(dof=3, dt=0.5)
-action_bound = np.array([[single_env.action_space.low[0], single_env.action_space.high[0]]] * action_dim, dtype=np.float32)
-
-agent = PPOContinuous(state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
-                      lmbda, epochs, eps, gamma, device)
-
-out_range_count = 0
-return_list = []
-
-def make_env_fn(seed_offset):
-    def _thunk():
-        env = testEnv(dof=dof, dt=dt)
-        return env
-    return _thunk
-
-if __name__ == "__main__":
-    # 创建 AsyncVectorEnv（在 Windows 上必须放到 main guard 内）
-    env_fns = [make_env_fn(i) for i in range(num_envs)]
-    vec_env = gymn.vector.AsyncVectorEnv(env_fns)
-
-    # reset vector env
-    obs, infos = vec_env.reset()
-    # 每个子环境单独收集轨迹，结束后调用 agent.update()
-    env_alive = [True] * num_envs
-    per_env_buffers = [{
-        'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': [], 'action_bounds': []
-    } for _ in range(num_envs)]
-
-    with tqdm(total=int(num_episodes), desc='Iteration') as pbar:
-        episode_counter = 0
-        while episode_counter < num_episodes:
-            # 对所有仍存活的 env 进行一步采样与执行
-            states_batch = obs  # shape (num_envs, state_dim)
-            actions_batch = []
-            for i in range(num_envs):
-                if env_alive[i]:
-                    s = states_batch[i]
-                    # agent.take_action 接受单个状态
-                    a = agent.take_action(s, action_bounds=action_bound, explore=True)
-                else:
-                    a = np.zeros(action_dim, dtype=np.float32)
-                actions_batch.append(a)
-            actions_np = np.array(actions_batch, dtype=np.float32)
-
-            # vector step
-            next_obs, rewards, terminateds, truncs, infos = vec_env.step(actions_np)
-            dones = np.logical_or(terminateds, truncs)
-
-            # 保存每个子环境的 transition
-            for i in range(num_envs):
-                if not env_alive[i]:
-                    continue
-                per_env_buffers[i]['states'].append(states_batch[i].copy())
-                per_env_buffers[i]['actions'].append(actions_np[i].copy())
-                per_env_buffers[i]['next_states'].append(next_obs[i].copy())
-                per_env_buffers[i]['rewards'].append(float(rewards[i]))
-                per_env_buffers[i]['dones'].append(bool(dones[i]))
-                per_env_buffers[i]['action_bounds'].append(action_bound.copy())
-
-                if infos and isinstance(infos, (list, tuple)):
-                    if infos[i].get('out_range', 0.0) == 1.0:
-                        out_range_count += 1
-
-                if dones[i]:
-                    # 完成一个环境的一个回合，构建 transition_dict 并更新 agent
-                    transition = per_env_buffers[i]
-                    # agent.update 期望 action_bounds 在 transition 中为步长序列或可广播
-                    agent.update(transition)
-                    return_list.append(sum(transition['rewards']))
-                    per_env_buffers[i] = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': [], 'action_bounds': []}
-                    env_alive[i] = True  # AsyncVectorEnv 会自动重置已结束的子环境，下一次 obs 会是新回合的初始 obs
-                    episode_counter += 1
-                    if episode_counter >= num_episodes:
-                        break
-
-            obs = next_obs
-            if episode_counter >= num_envs and episode_counter % 10 == 0:
-                pbar.set_postfix({'episodes_completed': '%d' % episode_counter,
-                                  'recent_return_mean': '%.3f' % (np.mean(return_list[-10:]) if len(return_list) >= 10 else float(np.nan))})
-            pbar.update(0 if episode_counter == 0 else 1)
-
-    vec_env.close()
-
-    # 绘图及测试部分保持原逻辑（可用单环境测试）
-    # ... existing plotting and single-env test code ...
-    episodes_list = list(range(len(return_list)))
-    plt.figure()
-    plt.plot(episodes_list, return_list)
-    plt.xlabel('Episodes')
-    plt.ylabel('Returns')
-    plt.title('PPO on {}'.format(env_name))
-
-    mv_return = moving_average(return_list, 9) if len(return_list) >= 9 else return_list
-    plt.figure()
-    plt.plot(episodes_list, mv_return)
-    plt.xlabel('Episodes')
-    plt.ylabel('Returns')
-    plt.title('PPO on {}'.format(env_name))
-
-    # 单环境测试回合
-    single_env = testEnv(dof=dof, dt=dt)
-    state, _ = single_env.reset(train=False)
-    done = False
-    car_trajectory = []
-    target_trajectory = []
-    episode_return = 0
-    while not done:
-        action = agent.take_action(state, action_bounds=action_bound, explore=False)
-        next_state, reward, terminated, truncated, info = single_env.step(action)
-        done = terminated or truncated
-        car_trajectory.append(single_env.state[0:dof].copy())
-        target_trajectory.append(single_env.target_pos_[0:dof].copy())
-        state = next_state
-        episode_return += reward
-
-    plt.figure(4)
-    for i in range(dof):
-        plt.subplot(dof, 1, i + 1)
-        pos_trajectory = [s[i] for s in car_trajectory]
-        target_pos_trajectory = [t[i] for t in target_trajectory]
-        plt.plot(range(len(pos_trajectory)), pos_trajectory, 'b-', label='Position')
-        plt.plot(range(len(target_pos_trajectory)), target_pos_trajectory, 'r--', label='Target Position')
-        plt.xlabel('Step')
-        plt.ylabel(f'Coordinate {i + 1}')
-        plt.legend()
-
-    plt.show()
-    print("出界次数：", out_range_count)
-    
-
-    '''
-    在 Windows 上必须把 AsyncVectorEnv 的创建放到 if name == "main" 下（上面已处理）。
-    agent.take_action 保留单 env 接口，训练时对每个子环境分别调用（性能仍有提升因为环境在子进程并行）。
-    testEnv 已改为符合 gymnasium 的 reset/step 签名，并把额外信息放到 info 中。
-    若要进一步把 agent.take_action 向量化以减少 Python 循环，可在 PPOContinuous 中添加 batch 版的 take_action（可以后续改进）。
-    '''
-
+# 注意：为了兼容原来的训练循环，请在构造 transition_dict 时保证：
+# - 'actions' 存储的是环境实际执行的动作 a_exec（未归一化）
+# - 如果动作区间随步变化，则 transition_dict['action_bounds'] 应为长度为步数的序列，
+#   其中每个元素是 (amin, amax) 或 标量 b（表示对称区间 [-b,b]）。
+# 示例：
+# transition = {
+#   'states': [...],
+#   'actions': [...],  # 执行到环境的动作
+#   'rewards': [...],
+#   'next_states': [...],
+#   'dones': [...],
+#   'action_bounds': [(amin0,amax0), (amin1,amax1), ...]  # 可选
+# }
