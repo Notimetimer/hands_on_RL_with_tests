@@ -300,7 +300,7 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 env_name = 'testEnv'
 # 并行环境数量
-num_envs =  1 # 4
+num_envs =  8 # 4
 # random.seed(0)
 # np.random.seed(0)
 # torch.manual_seed(0)
