@@ -127,11 +127,11 @@ class PolicyNetContinuous(torch.nn.Module):
         self.fc_mu = torch.nn.Linear(prev_size, action_dim)
         self.fc_std = torch.nn.Linear(prev_size, action_dim)
 
-    def forward(self, x, min_std=1e-3):
+    def forward(self, x, min_std=1e-3, max_std = 5):
         x = self.net(x)
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x))
-        std = torch.clamp(std, min=min_std)
+        std = torch.clamp(std, min=min_std, max=max_std)
         return mu, std
 
 
@@ -144,7 +144,7 @@ class PPOContinuous:
     - 如果 action_bounds 在训练时始终恒定（标量或单个区间），也可以直接把 action_bound
       作为常数传入 update()。
     - 在本实现中，策略内部输出的是标准化前的 mu 和 std（即对 u 的分布参数）。
-      对应的执行动作为：a = tanh(u)  -> normalized in (-1,1)
+      對應的執行動作為：a = tanh(u)  -> normalized in (-1,1)
       最后缩放到真实区间： a_exec = amin + (a+1)/2 * (amax-amin)
     - update() 中会把存储的 a_exec "反归一化" 回 normalized a（[-1,1]），以便计算 log_prob。
     '''
@@ -268,6 +268,11 @@ class PPOContinuous:
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
         td_delta = td_target - self.critic(states)
         advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
+
+        # # 对 advantage 做标准化：减均值除以标准差（避免除以零）
+        # adv_mean = advantage.mean()
+        # adv_std = advantage.std(unbiased=False)
+        # advantage = (advantage - adv_mean) / (adv_std + 1e-8)
 
         # 策略输出（未压缩的 mu,std）
         mu, std = self.actor(states)

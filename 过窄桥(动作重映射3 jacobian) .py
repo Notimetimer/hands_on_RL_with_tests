@@ -68,13 +68,6 @@ class Env:
         else:
             reward1 = 0 # -3
         return reward1
-    
-    # def get_reward(self):
-    #     if self.min_pos <= self.position <= self.max_pos:
-    #         reward1 = 1 - np.linalg.norm(self.position - (self.max_pos + self.min_pos) / 2) / 10
-    #     else:
-    #         reward1 = 0 # -3
-    #     return reward1
 
 # 改进算法
 
@@ -143,8 +136,8 @@ class SquashedNormal:
         # 为数值稳定性添加小量
         log_prob_u = self.normal.log_prob(u)
         # jacobian term
-        jacobian = 0
-        # jacobian = 2*(np.log(2.0)-u-F.softplus(-2*u))
+        # jacobian = 0
+        jacobian = 2*(np.log(2.0)-u-F.softplus(-2*u))
         # jacobian = torch.log(1 - a.pow(2) + self.eps)
         # sum over action dim, keep dims consistent: return (N, 1)
         return (log_prob_u - jacobian).sum(-1, keepdim=True)
