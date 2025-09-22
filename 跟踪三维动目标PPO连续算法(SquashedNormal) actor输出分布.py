@@ -82,6 +82,7 @@ class SquashedNormal:
         self.std = std
         self.normal = Normal(mu, std)
         self.eps = eps
+        self.mean = mu
 
     def sample(self):
         # rsample 以支持 reparameterization 重参数化采样, 结果是可导的
@@ -96,7 +97,7 @@ class SquashedNormal:
         # 为数值稳定性添加小量
         log_prob_u = self.normal.log_prob(u)
         # jacobian term
-        jacobian = torch.log(1 - a.pow(2) + self.eps) # fixme 应该+还是-？
+        jacobian = 0 # torch.log(1 - a.pow(2) + self.eps) # fixme 应该+还是-？
         # sum over action dim, keep dims consistent: return (N, 1)
         # 取消提前求和 # return (log_prob_u - jacobian).sum(-1, keepdim=True)
         return log_prob_u - jacobian  # 返回形状为 (batch_size, action_dim)
@@ -132,7 +133,8 @@ class PolicyNetContinuous(torch.nn.Module):
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x))
         std = torch.clamp(std, min=min_std, max=max_std)
-        return mu, std
+        Gaussian_output = SquashedNormal(mu, std)
+        return Gaussian_output
 
 
 class PPOContinuous:
@@ -210,17 +212,16 @@ class PPOContinuous:
 
     def take_action(self, state, action_bounds, explore=True):
         state = torch.tensor(np.array([state]), dtype=torch.float).to(self.device)
-        mu, std = self.actor(state)
-        dist = SquashedNormal(mu, std)
+        dist = self.actor(state)
         if explore:
             a_norm, u = dist.sample()
         else:
             # use mean action: tanh(mu)
-            u = mu
+            u = dist.mean
             a_norm = torch.tanh(u)
 
         a_exec = self._scale_action_to_exec(a_norm, action_bounds)
-        return a_exec[0].cpu().detach().numpy().flatten()
+        return a_exec[0].cpu().detach().numpy().flatten(), u[0].cpu().detach().numpy().flatten()
     
 
     def update(self, transition_dict, action_bounds=None):
@@ -233,36 +234,11 @@ class PPOContinuous:
         存储的 'actions' 应当是环境执行动作 (a_exec 未归一化）。
         """
         states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
-        actions_exec = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
+        u_old = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
         rewards = torch.tensor(np.array(transition_dict['rewards']), dtype=torch.float).view(-1, 1).to(self.device)
         next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
         dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
         action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
-
-        # if action_bounds is None:
-        #     if 'action_bounds' in transition_dict:
-        #         action_bounds = transition_dict['action_bounds']
-        #     else:
-        #         action_bounds = 1.0  # 默认值
-
-        # # 将 action_bounds 处理为每步的数组
-        # if isinstance(action_bounds, (int, float)):
-        #     # 对称区间，扩展为每步相同的区间
-        #     # action_bounds_arr = [action_bounds] * len(transition_dict['actions'])
-        #     amin_list = [-float(action_bounds)] * len(transition_dict['actions'])
-        #     amax_list = [float(action_bounds)] * len(transition_dict['actions'])
-        # elif isinstance(action_bounds, (tuple, list, np.ndarray)) and len(action_bounds) == 2:
-        #     # 二元元组或列表，扩展为每步相同的 min 和 max
-        #     amin_list = [float(action_bounds[0])] * len(transition_dict['actions'])
-        #     amax_list = [float(action_bounds[1])] * len(transition_dict['actions'])
-        # else:
-        #     # 每步不同的区间，直接解包
-        #     amin_list = [float(ab[0]) if isinstance(ab, (tuple, list, np.ndarray)) else -float(ab) for ab in action_bounds]
-        #     amax_list = [float(ab[1]) if isinstance(ab, (tuple, list, np.ndarray)) else float(ab) for ab in action_bounds]
-
-        # # 转换为张量
-        # amin_tensor = torch.tensor(amin_list, dtype=actions_exec.dtype, device=self.device).unsqueeze(-1)
-        # amax_tensor = torch.tensor(amax_list, dtype=actions_exec.dtype, device=self.device).unsqueeze(-1)
 
         # 计算 td_target, advantage
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
@@ -275,43 +251,38 @@ class PPOContinuous:
         # advantage = (advantage - adv_mean) / (adv_std + 1e-8)
 
         # 策略输出（未压缩的 mu,std）
-        mu, std = self.actor(states)
-        # 构造 SquashedNormal 并计算 old_log_probs
-        dist = SquashedNormal(mu.detach(), std.detach())
+        dist = self.actor(states)
+        # # 构造 SquashedNormal 并计算 old_log_probs
+        # dist = SquashedNormal(mu.detach(), std.detach())
 
-        # 将执行动作反向归一化到 [-1,1]，以便计算 log_prob
-        actions_normalized = self._unscale_exec_to_normalized(actions_exec, action_bounds)
+        # # 将执行动作反向归一化到 [-1,1]，以便计算 log_prob
+        # actions_normalized = self._unscale_exec_to_normalized(actions_exec, action_bounds)
         
-        # 反算 u = atanh(a)
-        u_old = torch.atanh(actions_normalized)
-        old_log_probs = dist.log_prob(actions_normalized, u_old)
+        # # 反算 u = atanh(a)
+        # u_old = torch.atanh(actions_normalized)
+        old_log_probs = dist.log_prob(0, u_old)
 
         if torch.isnan(old_log_probs).any():
             raise ValueError("old_log_probs 包含 NaN，检查 action_bounds 或 actions 的合法性")
 
         for _ in range(self.epochs):
-            mu, std = self.actor(states)
-            if torch.isnan(mu).any() or torch.isnan(std).any():
-                raise ValueError("NaN in Actor outputs in loop")
-            critic_values = self.critic(states)
-            if torch.isnan(critic_values).any():
-                raise ValueError("NaN in Critic outputs in loop")
-
-            dist = SquashedNormal(mu, std)
+            dist = self.actor(states)
             # 计算当前策略对历史执行动作的 log_prob（使用同一个 u_old）
-            log_probs = dist.log_prob(actions_normalized, u_old)
+            log_probs = dist.log_prob(0, u_old)
 
             ratio = torch.exp(log_probs - old_log_probs)
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
             # 取消提前求和 # actor_loss = -torch.min(surr1, surr2).mean() - 0.1 * dist.entropy().mean()
-            actor_loss = -torch.min(surr1, surr2).sum(-1).mean() - 0.1 * dist.entropy().mean()
+            
+            entropy_factor = torch.clamp(dist.entropy().mean(), -20, 7) # 最大e^2
+            actor_loss = -torch.min(surr1, surr2).sum(-1).mean() - 0.1 * entropy_factor
             # ↑如果求和之和还要保留原先的张量维度，用torch.sum(torch.min(surr1,surr2),dim=-1,keepdim=True)
 
             critic_loss = F.mse_loss(self.critic(states), td_target.detach())
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
-            actor_loss.backward()
+            actor_loss.backward(retain_graph=True)
             critic_loss.backward()
 
             # 梯度裁剪
@@ -382,15 +353,15 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
         while not done:  # 每个训练回合
             # state_check=state
             # 1.执行动作得到环境反馈
-            action = agent.take_action(state, action_bounds=action_bound, explore=True)
+            action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
             # tracking_test2.step 返回 (obs, reward, terminated, truncated, info)
             next_state, reward, terminated, truncated, info = env.step(action)
             done = bool(terminated or truncated)
             reward_plus = info.get('reward_plus', 0.0)
             transition_dict['states'].append(state)
-            transition_dict['actions'].append(action)
+            transition_dict['actions'].append(u)
             transition_dict['next_states'].append(next_state)
-            transition_dict['rewards'].append(reward + 0*reward_plus)
+            transition_dict['rewards'].append(reward)
             transition_dict['dones'].append(done)
             transition_dict['action_bounds'].append(action_bound)
             state = next_state
@@ -434,7 +405,7 @@ episode_return = 0
 state, _ = env.reset(train=False)
 done = False
 while not done:  # 测试回合
-    action = agent.take_action(state, action_bounds=action_bound, explore=False)
+    action, _ = agent.take_action(state, action_bounds=action_bound, explore=False)
     next_state, reward, terminated, truncated, info = env.step(action)
     done = bool(terminated or truncated)
     # reward_plus 若需要可从 info 获取
