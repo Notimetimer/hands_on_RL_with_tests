@@ -64,6 +64,7 @@ class AutoResetWrapper(gymn.Wrapper):
             return obs, reward, terminated, truncated, info
 
 # --------------- 在模块顶层定义一个可 picklable 的 env 工厂 ---------------
+# 闭包
 def make_env_fn(seed_offset=0):
     """返回一个零参数的可调用 thunk，供 AsyncVectorEnv 使用（顶层可 picklable）"""
     def _thunk():
@@ -71,6 +72,57 @@ def make_env_fn(seed_offset=0):
         # 注意：不要在这里调用 env.reset(seed=...)，改为在主流程的 transition_dict_capacity 定义后统一 reset
         return env
     return _thunk
+# partial
+from functools import partial
+def create_env(seed):
+    env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+    env.reset(seed=seed)
+    return env
+# 可调用类
+class EnvFactory:
+    def __init__(self, seed):
+        self.seed = seed
+    def __call__(self):
+        env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+        env.reset(seed=self.seed)
+        return env
+'''
+↑这是闭包写法，三种较为常用、安全的写法有：
+1、传统 thunk（常见但在 spawn(windows) 下可能不可 pickle ）：
+def make_env_fn(seed_offset=0):
+    def _thunk():
+        env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+        env.reset(seed=seed_offset)
+        return env
+    return _thunk
+...
+env_fns = [make_env_fn(i) for i in range(num_envs)]
+
+2、用 functools.partial（更稳妥，create_env 必须是模块顶层函数）：
+from functools import partial
+def create_env(seed):
+    env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+    env.reset(seed=seed)
+    return env
+...
+env_fns = [partial(create_env, i) for i in range(num_envs)]
+
+3、可调用类（顶层定义，完全可 picklable）：
+class EnvFactory:
+    def __init__(self, seed):
+        self.seed = seed
+    def __call__(self):
+        env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+        env.reset(seed=self.seed)
+        return env
+...
+env_fns = [EnvFactory(i) for i in range(num_envs)]
+
+注意：
+在文件顶层定义工厂（或类/函数），不要用 lambda 或在局部作用域定义不可 picklable 的对象；
+用 partial 或可调用类能提高在 Windows 下的兼容性；thunk 常用但要确认在你的环境（spawn/pickle）下可用。
+
+'''
 
 # 将原来把 env 创建放在 main() 的位置改为：把 main guard 提前到超参数之前，
 # 在 guard 内用 make_env_fn 构建 env_fns 并创建 AsyncVectorEnv。
@@ -96,7 +148,15 @@ if __name__ == '__main__':
     freeze_support()  # Windows: 推荐调用
     
     # 为每个子环境生成一个 thunk（顶层函数返回的闭包是可 picklable 的）
-    env_fns = [make_env_fn(i) for i in range(num_envs)]
+    # # 闭包
+    # env_fns = [make_env_fn(i) for i in range(num_envs)]
+
+    # # partial
+    # env_fns = [partial(create_env, i) for i in range(num_envs)]
+
+    # 可调用类
+    env_fns = [EnvFactory(i) for i in range(num_envs)]
+
     # 创建异步向量环境（必须在主保护下进行）
     env = gymn.vector.AsyncVectorEnv(env_fns)
 
