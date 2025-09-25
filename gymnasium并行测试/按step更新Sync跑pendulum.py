@@ -66,8 +66,28 @@ class AutoResetWrapper(gymn.Wrapper):
 def make_env():
     # 使用自定义 AutoResetWrapper 使每个子环境在结束后自动重置（不需要同步结束）
     return AutoResetWrapper(gymn.make("Pendulum-v1"))
-
-
+def make_env_fn(seed_offset=0):
+    """返回一个零参数的可调用 thunk，供 AsyncVectorEnv 使用（顶层可 picklable）"""
+    def _thunk():
+        env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+        # 注意：不要在这里调用 env.reset(seed=...)，改为在主流程的 transition_dict_capacity 定义后统一 reset
+        return env
+    return _thunk
+# partial
+from functools import partial
+def create_env(seed):
+    env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+    env.reset(seed=seed)
+    return env
+# 可调用类
+class EnvFactory:
+    def __init__(self, seed):
+        self.seed = seed
+    def __call__(self):
+        env = AutoResetWrapper(gymn.make("Pendulum-v1"))
+        env.reset(seed=self.seed)
+        return env
+    
 # dof = 3
 # 超参数
 actor_lr = 1e-4 # 1e-4 1e-6  # 2e-5 警告，学习率过大会出现"nan"
@@ -82,8 +102,19 @@ k_entropy=0
 transition_dict_capacity = 200
 num_envs = 5 # 子环境数目
 
+# 简单工厂函数
+# env_fns=[make_env for _ in range(num_envs)]
 
-env = gymn.vector.SyncVectorEnv([make_env for _ in range(num_envs)])
+# # 闭包
+# env_fns = [make_env_fn(i) for i in range(num_envs)]
+
+# # partial
+# env_fns = [partial(create_env, i) for i in range(num_envs)]
+
+# 可调用类
+env_fns = [EnvFactory(i) for i in range(num_envs)]
+
+env = gymn.vector.SyncVectorEnv(env_fns)
 from tqdm import tqdm
 obs_space = env.single_observation_space
 action_space = env.single_action_space
