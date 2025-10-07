@@ -8,7 +8,9 @@ from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib
-
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 matplotlib.use('Qt5Agg')  # 使用Qt5作为后端
 from gym import spaces
 from numpy.linalg import norm
@@ -22,12 +24,13 @@ dof = 3
 # PPO超参数
 actor_lr = 1e-3 / 10  # 1e-4 1e-6  # 2e-5 警告，学习率过大会出现"nan"
 critic_lr = actor_lr * 10  # 1e-3  9e-3  5e-3 为什么critic学习率大于一都不会梯度爆炸？ 为什么设置成1e-5 也会爆炸？ chatgpt说要actor的2~10倍
-num_episodes = 2000  # 2000
+num_episodes = 1000  # 2000
 hidden_dim = [128]  # 128
 gamma = 0.9
 lmbda = 0.9
 epochs = 10  # 10
 eps = 0.2
+
 # AM超参数
 tau_A = 1.25
 p_star_A = 0.1
@@ -109,7 +112,7 @@ class PolicyNetContinuous(torch.nn.Module):
 
     def forward(self, x, action_bound=2.0):
         x = self.net(x)
-        mu = action_bound * torch.tanh(self.fc_mu(x))
+        mu = action_bound * self.fc_mu(x) # torch.tanh(self.fc_mu(x))
         std = F.softplus(self.fc_std(x))  # + 1e-8
         return mu, std
 

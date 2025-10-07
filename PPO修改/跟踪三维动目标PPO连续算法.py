@@ -8,6 +8,9 @@ from torch import nn
 import torch.nn.functional as F
 import matplotlib.pyplot as plt
 import matplotlib
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 matplotlib.use('Qt5Agg')  # 使用Qt5作为后端
 from gym import spaces
@@ -93,7 +96,7 @@ class PolicyNetContinuous(torch.nn.Module):
 
     def forward(self, x, action_bound=2.0):
         x = self.net(x)
-        mu = action_bound * torch.tanh(self.fc_mu(x))
+        mu = action_bound * self.fc_mu(x) # * torch.tanh(self.fc_mu(x))
         std = action_bound * F.softplus(self.fc_std(x))  # + 1e-8
         return mu, std
 
