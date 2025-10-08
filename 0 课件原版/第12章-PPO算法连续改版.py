@@ -72,7 +72,7 @@ class PolicyNetContinuous(torch.nn.Module):
 
     def forward(self, x, action_bound=2.0):
         x = self.net(x)
-        mu = action_bound * torch.tanh(self.fc_mu(x))
+        mu = action_bound * self.fc_mu(x) #  * torch.tanh(self.fc_mu(x))
         std = F.softplus(self.fc_std(x)) #  + 1e-8
         return mu, std
 

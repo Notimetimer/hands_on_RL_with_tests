@@ -73,7 +73,8 @@ class PolicyNetDiscrete(torch.nn.Module):
 
     def forward(self, x):
         x = self.net(x)
-        return F.softmax(self.fc_out(x), dim=1)
+        # 返回 logits
+        return self.fc_out(x)
 
 
 class PPO_discrete:
@@ -92,9 +93,16 @@ class PPO_discrete:
         self.eps = eps  # PPO中截断范围的参数
         self.device = device
 
+    def choose_action(self, state): # todo 加上shield输入
+        logits = self.actor(state)                     
+        probs = F.softmax(logits, dim=1)
+        return probs
+    
     def take_action(self, state):
         state = torch.tensor([state], dtype=torch.float).to(self.device)
-        probs = self.actor(state)
+        # logits = self.actor(state)                     
+        # probs = F.softmax(logits, dim=1)
+        probs = self.choose_action(state)
         action_dist = torch.distributions.Categorical(probs) # 离散的输出为类别分布
         action = action_dist.sample()
         return action.item()
@@ -120,13 +128,17 @@ class PPO_discrete:
         advantage = compute_advantage(self.gamma, self.lmbda,
                                                td_delta.cpu()).to(self.device)
         
-        # print("actions",self.actor(states))
-        # print("gather",self.actor(states).gather(1, actions))
-        old_log_probs = torch.log(self.actor(states).gather(1,
-                                                            actions)).detach()
+        # 先从 actor 得到 logits，再做soft max以获得概率
+        # logits_old = self.actor(states)
+        # probs_old = F.softmax(logits_old, dim=1)
+        probs_old = self.choose_action(states)
+        old_log_probs = torch.log(probs_old.gather(1, actions)).detach()
 
         for _ in range(self.epochs):
-            log_probs = torch.log(self.actor(states).gather(1, actions)) # 从actor输出序列中的每一行抽取编号为actions同行的动作
+            # logits = self.actor(states)
+            # probs = F.softmax(logits, dim=1)
+            probs = self.choose_action(states)
+            log_probs = torch.log(probs.gather(1, actions)) # 从actor输出序列中的每一行抽取编号为actions同行的动作
             ratio = torch.exp(log_probs - old_log_probs)
             surr1 = ratio * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps,      # torch.clamp(x,min,max)裁剪
@@ -142,63 +154,85 @@ class PPO_discrete:
             self.critic_optimizer.step()
 
 # 加入新的 仿真环境：石头剪刀布，每回合10场。对手策略：初始随机，
-# 若对手赢则保持不变；若对手输则按 rock->paper, paper->scissors, scissors->rock 旋转（opp = (opp+1)%3）
+# 若对手赢则保持不变；若对手输則按 rock->paper, paper->scissors, scissors->rock 旋转（opp = (opp+1)%3）
 class RPS_Env(gym.Env):
     """
-    Observation: 4-dim vector: one-hot opponent move (3 dims) + normalized round_idx (1 dim)
+    Observation: 4-dim vector:
+      - prev opponent move (one-hot, 3)
+      - prev result scalar: win=1.0, tie=0.0, loss=-1.0 (1 dim)
     Action: 0=rock,1=paper,2=scissors
     Reward: +1 win, -1 loss, 0 tie
-    Episode length: 10 rounds
+    Episode length: rounds_per_episode (内部计数，不作为观测)
+    Opponent rule: initial random; if opponent loses (agent wins) -> rotate opp move (0->1->2->0),
+                   if opponent wins or tie -> keep same.
     """
     metadata = {'render.modes': []}
     def __init__(self, rounds_per_episode=10, seed=None):
         super().__init__()
         self.rounds_per_episode = rounds_per_episode
         self.action_space = gym.spaces.Discrete(3)
-        # observation: 3 one-hot + 1 scalar normalized round index
-        self.observation_space = gym.spaces.Box(low=0.0, high=1.0, shape=(4,), dtype=np.float32)
+        # prev opp one-hot (3) + prev result scalar (1)
+        self.observation_space = gym.spaces.Box(low=np.array([0.0,0.0,0.0,-1.0], dtype=np.float32),
+                                                high=np.array([1.0,1.0,1.0, 1.0], dtype=np.float32),
+                                                shape=(4,), dtype=np.float32)
         self._rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
-        self.opp_move = None
+        self.opp_move = 0          # opponent's current move (used this step)
+        self.prev_opp_move = 0     # opponent move from previous step (for observation)
+        self.prev_result = 0.0     # previous result scalar: 1.0 win, 0.0 tie, -1.0 loss
         self.round_idx = 0
 
     def seed(self, s=None):
         self._rng = np.random.RandomState(s)
 
     def reset(self):
-        self.opp_move = int(self._rng.randint(0,3))  # 0/1/2
+        # initialize opponent current move
+        self.opp_move = int(self._rng.randint(0, 3))
+        # previous info for the first step should be random per要求
+        self.prev_opp_move = int(self._rng.randint(0, 3))
+        self.prev_result = float(self._rng.choice([1.0, 0.0, -1.0]))
         self.round_idx = 0
         return self._get_obs()
 
     def step(self, action):
-        # action: 0/1/2
         assert self.action_space.contains(action)
         agent = int(action)
-        opp = int(self.opp_move)
-        # compute outcome from agent perspective: (a - o) mod 3: 1 -> win, 2 -> lose, 0 tie
+        opp = int(self.opp_move)            # opponent's action used this round (current)
+        # outcome from agent perspective: (agent - opp) mod 3 -> 1 win, 2 lose, 0 tie
         diff = (agent - opp) % 3
         if diff == 1:
             reward = 1.0
-            # opponent lost -> update opponent move as specified
-            self.opp_move = (self.opp_move + 1) % 3
+            # opponent lost -> update opponent move for next round by rotating
+            next_opp = (self.opp_move + 1) % 3
+            result_scalar = 1.0   # agent win
         elif diff == 2:
             reward = -1.0
-            # opponent won -> keep same
-            # (no change)
+            next_opp = self.opp_move  # opponent won -> keep same
+            result_scalar = -1.0  # agent loss
         else:
             reward = 0.0
-            # tie -> keep same
+            next_opp = self.opp_move  # tie -> keep same
+            result_scalar = 0.0   # tie
+
+        # set previous info for next state's observation:
+        self.prev_opp_move = opp
+        self.prev_result = result_scalar
+
+        # update opponent for next round
+        self.opp_move = next_opp
 
         self.round_idx += 1
         done = (self.round_idx >= self.rounds_per_episode)
         obs = self._get_obs()
-        info = {'opp_move': int(self.opp_move)}
+        info = {'opp_move': int(self.opp_move), 'prev_result': float(self.prev_result)}
         return obs, float(reward), bool(done), info
 
     def _get_obs(self):
-        onehot = np.zeros(3, dtype=np.float32)
-        onehot[self.opp_move] = 1.0
-        norm_round = np.array([self.round_idx / max(1, self.rounds_per_episode - 1)], dtype=np.float32)
-        return np.concatenate([onehot, norm_round])
+        # prev opponent one-hot
+        onehot_prev_opp = np.zeros(3, dtype=np.float32)
+        onehot_prev_opp[self.prev_opp_move] = 1.0
+        # prev result scalar as one float
+        res_scalar = np.array([self.prev_result], dtype=np.float32)
+        return np.concatenate([onehot_prev_opp, res_scalar])
 
 # 超参数
 actor_lr = 1e-3
