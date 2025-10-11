@@ -402,6 +402,7 @@ class PPOContinuous:
 
             # AM
             # print('原有CriticLoss',critic_loss)
+
             # critic_loss = torch.max(F.mse_loss(self.critic(states), v_target_mb),
             #                         F.mse_loss(old_critic_values + torch.clamp(self.critic(states) - old_critic_values,
             #                                                                    -self.eps, self.eps), v_target_mb)

@@ -245,13 +245,13 @@ class PPOContinuous:
             #                         F.mse_loss(old_critic_values + torch.clamp(self.critic(states) - old_critic_values,
             #                                                                    -self.eps, self.eps), v_target_mb)
             #                         )  # test 1
-            # critic_loss = torch.mean(
-            #     torch.max((self.critic(states) - v_target_mb)**2,
-            #               (old_critic_values + torch.clamp(self.critic(states) - old_critic_values, -self.eps,
-            #                                                          self.eps) - v_target_mb)**2
-            #               ))  # test 2
+            critic_loss = torch.mean(
+                torch.max((self.critic(states) - v_target_mb)**2,
+                          (old_critic_values + torch.clamp(self.critic(states) - old_critic_values, -self.eps,
+                                                                     self.eps) - v_target_mb)**2
+                          ))  # test 2
 
-            critic_loss = F.mse_loss(self.critic(states), v_target_mb)  # test 3
+            # critic_loss = F.mse_loss(self.critic(states), v_target_mb)  # test 3
 
             # print('新的CriticLoss',critic_loss)
             loss = actor_loss + 1 * critic_loss - 0.01*dist_entropy  # 添加一个熵正则项
