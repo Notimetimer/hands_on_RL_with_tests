@@ -3,7 +3,7 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 import matplotlib.pyplot as plt
-
+from math import *
 def _wrap_angle(a):
     return (a + math.pi) % (2 * math.pi) - math.pi
 
@@ -15,7 +15,7 @@ import collections
 import torch
 from torch import nn
 import torch.nn.functional as F
-from math import *
+
 from gym import spaces
 from numpy.linalg import norm
 from torch.distributions import Normal
@@ -29,46 +29,6 @@ gamma = 0.9
 lmbda = 0.9
 epochs = 10  # 10
 eps = 0.2
-
-
-def sub_of_radian(input1, input2):
-    # 弧度减法
-    # 计算两个弧度的差值，范围为[-pi, pi]
-    diff = input1 - input2
-    diff = (diff + np.pi) % (2 * np.pi) - np.pi
-    return diff
-
-def calc_intern_dist2cylinder(R, pos_, psi, theta):
-    """
-    计算飞机到圆柱形边界的斜距离
-    
-    参数:
-    R: float, 圆柱形边界半径
-    rho: float, 飞机到圆心的距离
-    eta: float, 飞机相对于圆心的方位角（弧度）
-    psi: float, 飞机航向角（弧度）
-    theta: float, 飞机俯仰角（弧度）
-    
-    返回:
-    d: float, 飞机到边界的斜距离
-    dh: float, 飞机到边界的水平距离
-    pos_: ndarray, 飞机位置坐标 [北、天、东]
-    """
-    # 计算飞机位置
-    pos_on_floor_ = np.array([pos_[0], 0, pos_[2]])
-    rho = norm(pos_on_floor_)
-    eta = atan2(pos_[2], pos_[0])
-    
-    # 计算水平距离
-    dh_list = rho*cos(pi+eta-psi) + sqrt(R**2-rho**2*sin(pi+eta-psi)**2)
-    dh = dh_list
-    
-    # 计算斜距离
-    d = dh/(cos(theta)+1e-5)
-
-    # 边界在飞机的左边还是右边
-    left_or_right = np.sign(sub_of_radian(eta, psi)) # -1 左边，0 中间，1 右边
-    return d, dh, left_or_right
 
 
 def moving_average(a, window_size):
@@ -237,165 +197,135 @@ class PPOContinuous:
             self.critic_optimizer.step()
 
 
+###################################################################
+
 class CarHeadingEnv(gym.Env):
     """
-    Car driving in a circle boundary:
-    - Constant speed: 10 m/s
-    - Max angular velocity: 5 rad/s
-    - Circle boundary: radius 30m
-    - State: [dh/R, left_or_right] where dh is distance to boundary
+    Simple planar car with constant forward speed.
+    - State: [heading_error, heading_error_rate]
+      heading_error = wrap(desired_heading - current_heading) in radians
+      heading_error_rate approximated by finite difference
     - Action: angular velocity (rad/s), continuous scalar
-    - Episode ends when car exits circle
-    - Reward: dh/R (normalized distance to boundary) if inside, large negative if outside
+    - Each episode runs fixed n_steps (default 100)
+    - Reward: dense, negative quadratic of heading_error: r = - (heading_error**2)
+    - render(): plots trajectory using matplotlib (collects positions during episode)
+    Gymnasium API: reset() -> (obs, info), step(a) -> (obs, reward, terminated, truncated, info)
     """
     metadata = {"render_modes": ["human"]}
 
     def __init__(self,
                  max_steps: int = 100,
                  dt: float = 0.1,
-                 speed: float = 10.0,  # 固定速度10
-                 max_omega: float = 5.0,  # 最大角速度5
-                 circle_radius: float = 30.0,  # 圆形边界半径
+                 speed: float = 1.0,
+                 max_omega: float = 2.0,
                  seed: int = None):
         super().__init__()
         self.max_steps = int(max_steps)
         self.dt = float(dt)
         self.speed = float(speed)
         self.max_omega = float(max_omega)
-        self.R = float(circle_radius)
 
         # action: angular velocity scalar
-        self.action_space = spaces.Box(
-            low=np.array([-self.max_omega], dtype=np.float32),
-            high=np.array([self.max_omega], dtype=np.float32),
-            shape=(1,), dtype=np.float32)
-        
-        # observation: [dh/R, left_or_right]
-        # dh/R normalized to [0,1], left_or_right in [-1,0,1]
-        self.observation_space = spaces.Box(
-            low=np.array([0.0, -1.0], dtype=np.float32),
-            high=np.array([1.0, 1.0], dtype=np.float32),
-            dtype=np.float32)
+        self.action_space = spaces.Box(low=np.array([-self.max_omega], dtype=np.float32),
+                                       high=np.array([self.max_omega], dtype=np.float32),
+                                       shape=(1,), dtype=np.float32)
+        # observation: heading_error in radians (-pi,pi), derivative (rad/s) bounded
+        obs_high = np.array([math.pi, self.max_omega * 2], dtype=np.float32)
+        obs_low = -obs_high
+        self.observation_space = spaces.Box(low=obs_low, high=obs_high, dtype=np.float32)
 
         self._rng = np.random.RandomState(seed) if seed is not None else np.random.RandomState()
         self.seed(seed)
 
         # internal state
-        self.current_heading = 0.0  # 当前航向角
+        self.current_heading = 0.0
+        self.desired_heading = 0.0
+        self.prev_error = 0.0
         self.step_count = 0
-        
-        # position state
-        self.x = 0.0  # 北向位置
-        self.y = 0.0  # 东向位置
-        self.trajectory = []  # 轨迹存储
+        self.error_dot = 0.0
+
+        # rendering buffers
+        self.x = 0.0
+        self.y = 0.0
+        self.trajectory = []
 
     def seed(self, seed=None):
         self._rng = np.random.RandomState(seed)
 
-    def get_state(self):
-        # 计算到边界距离
-        pos_ = np.array([self.x, 0.0, self.y])  # [北,天,东]
-        d, dh, left_or_right = calc_intern_dist2cylinder(
-            self.R, pos_, self.current_heading, 0.0)
-        
-        # 加入遮罩：当 dh > 20 时，将 dh 限制为 20，left_or_right 置为 0
-        mask_threshold = 20.0
-        if dh > mask_threshold:
-            dh = mask_threshold
-            left_or_right = 0.0
-            
-        # 归一化 dh/R 到 [0,1]（使用遮罩后的 dh）
-        norm_dh = min(max(dh/self.R, 0.0), 1.0)
-        return np.array([norm_dh, left_or_right], dtype=np.float32)
+    def get_state(self,):
+        error = _wrap_angle(self.desired_heading - self.current_heading)
+        error_dot = self.error_dot
+        return np.array([sin(error), cos(error), error_dot])
 
     def reset(self, *, seed=None, options=None):
         if seed is not None:
             self.seed(seed)
-            
-        # 重置位置到圆心
-        self.x = 0.0
-        self.y = 0.0
-        # 随机初始航向
-        self.current_heading = self._rng.uniform(-np.pi, np.pi)
+        # randomize headings (uniform -pi..pi)
+        self.current_heading = self._rng.uniform(-math.pi, math.pi)
+        self.desired_heading = self._rng.uniform(-math.pi, math.pi)
+        self.prev_error = _wrap_angle(self.desired_heading - self.current_heading)
         self.step_count = 0
-        
-        # 重置轨迹
+
+        # reset pose for render
+        self.x, self.y = 0.0, 0.0
         self.trajectory = [(self.x, self.y)]
-        
-        obs = self.get_state()
+
+        obs = np.array([sin(self.prev_error), cos(self.prev_error), 0.0], dtype=np.float32)  # error, error_dot (0 at reset)
         return obs, {}
 
     def step(self, action):
         # clip action
-        omega = float(np.clip(action, -self.max_omega, self.max_omega).item() 
-                     if hasattr(action, "item") else np.clip(action, -self.max_omega, self.max_omega))
-        
-        # update heading
+        omega = float(np.clip(action, -self.max_omega, self.max_omega).item() if hasattr(action, "item") else np.clip(action, -self.max_omega, self.max_omega))
+        # apply continuous-time approximate dynamics
+        # heading integrates angular velocity
         self.current_heading = _wrap_angle(self.current_heading + omega * self.dt)
-        
-        # update position
+
+        # update position (for render) with constant forward speed along current heading
         self.x += self.speed * math.cos(self.current_heading) * self.dt
         self.y += self.speed * math.sin(self.current_heading) * self.dt
         self.trajectory.append((self.x, self.y))
 
-        # get new state (with masking)
-        obs = self.get_state()
-        
-        # check if outside circle
-        r = math.sqrt(self.x * self.x + self.y * self.y)
-        outside = r > self.R
-        
-        # compute reward using masked dh
-        if outside:
-            reward = -10.0  # 出界惩罚
-            terminated = True
-        else:
-            # obs[0] already contains the normalized masked dh/R
-            reward = obs[0]  # 奖励使用遮罩后的归一化边界距离 dh/R
-            terminated = False
+        # compute new error and derivative
+        error = _wrap_angle(self.desired_heading - self.current_heading)
+        self.error_dot = _wrap_angle(error-self.prev_error) / self.dt
 
+        # reward: dense, negative quadratic of heading error (you can scale)
+        reward = + (error ** 2)
+
+        self.prev_error = error
         self.step_count += 1
-        truncated = bool(self.step_count >= self.max_steps)
-        
-        info = {
-            "position": (self.x, self.y),
-            "heading": float(self.current_heading),
-            "step": int(self.step_count)
-        }
-        
+        terminated = bool(self.step_count >= self.max_steps)
+        truncated = False
+
+        obs = np.array([sin(error), cos(error), self.error_dot], dtype=np.float32)
+        info = {"current_heading": float(self.current_heading),
+                "desired_heading": float(self.desired_heading),
+                "step": int(self.step_count)}
         return obs, float(reward), terminated, truncated, info
 
     def render(self, mode="human", show=True):
-        # 创建图形
-        plt.figure(figsize=(8,8))
-        
-        # 画圆形边界
-        circle = plt.Circle((0, 0), self.R, fill=False, color='red', linestyle='--', label='boundary')
-        plt.gca().add_patch(circle)
-        
-        # 画轨迹
+        # visualize trajectory and headings
         xs, ys = zip(*self.trajectory) if self.trajectory else ([0.0], [0.0])
+        plt.figure(figsize=(6,6))
         plt.plot(xs, ys, '-o', markersize=3, label='trajectory')
         plt.scatter([xs[0]], [ys[0]], c='green', label='start')
         plt.scatter([xs[-1]], [ys[-1]], c='red', label='end')
 
-        # 画最后位置的航向
+        # draw desired heading vector from origin
+        origin = (0.0, 0.0)
+        dhx = math.cos(self.desired_heading)
+        dhy = math.sin(self.desired_heading)
+        plt.arrow(origin[0], origin[1], dhx, dhy, head_width=0.05, color='orange', length_includes_head=True, label='desired')
+
+        # draw final heading vector from last position
         fhx = math.cos(self.current_heading)
         fhy = math.sin(self.current_heading)
-        plt.arrow(xs[-1], ys[-1], fhx * 2, fhy * 2, 
-                 head_width=0.5, color='blue', 
-                 length_includes_head=True, label='heading')
+        plt.arrow(xs[-1], ys[-1], fhx * 0.5, fhy * 0.5, head_width=0.03, color='blue', length_includes_head=True, label='final heading')
 
         plt.axis('equal')
         plt.grid(True)
         plt.title(f"Car trajectory (steps={len(xs)})")
         plt.legend()
-        
-        # 设置显示范围略大于圆形边界
-        margin = self.R * 0.2
-        plt.xlim(-self.R-margin, self.R+margin)
-        plt.ylim(-self.R-margin, self.R+margin)
-        
         if show:
             plt.show()
 
@@ -406,16 +336,13 @@ class CarHeadingEnv(gym.Env):
 import numpy as np
 import matplotlib.pyplot as plt
 
-dt = 0.2
-max_steps = int(2*pi*30/10/dt)
-
 # 假设 CarHeadingEnv 已在当前命名空间定义为 CarHeadingEnv（如 notebook 前面单元格）
-env = CarHeadingEnv(max_steps=max_steps, dt=dt, speed=10.0, max_omega=5.0, seed=0)
+env = CarHeadingEnv(max_steps=100, dt=0.1, speed=1.0, max_omega=2.0, seed=0)
 env.seed(0)
 np.random.seed(0)
 
 device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-state_dim = 2
+state_dim = 3
 action_dim = 1
 action_bound = 1  # 动作最大值
 agent = PPOContinuous(state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
@@ -424,7 +351,8 @@ agent = PPOContinuous(state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
 returns = []
 
 for ep in range(num_episodes):
-    print(ep, "in", num_episodes, "epidosdes")
+    if ep %10 ==0:
+        print(ep, "in", num_episodes, "epidosdes")
     obs, info = env.reset()
     ep_ret = 0.0
     transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': []}
