@@ -66,6 +66,34 @@ class Env:
 
 # 改进算法
 
+
+# 计算并记录 actor / critic 的梯度范数（L2）
+def model_grad_norm(model):
+    total_sq = 0.0
+    found = False
+    for p in model.parameters():
+        if p.grad is not None:
+            g = p.grad.detach().cpu()
+            total_sq += float(g.norm(2).item()) ** 2
+            found = True
+    return float(total_sq ** 0.5) if found else float('nan')
+
+def check_weights_bias_nan(model, model_name="model", place=None):
+    """检查模型中名为 weight/bias 的参数是否包含 NaN，发现则抛出异常。
+    参数:
+      model: torch.nn.Module
+      model_name: 用于错误消息中标识模型（如 "actor"/"critic"）
+      place: 字符串，调用位置/上下文（如 "update_loop","pretrain_step"），用于更明确的错误报告
+    """
+    for name, param in model.named_parameters():
+        if ("weight" in name) or ("bias" in name):
+            if param is None:
+                continue
+            if torch.isnan(param).any():
+                loc = f" at {place}" if place else ""
+                raise ValueError(f"NaN detected in {model_name} parameter '{name}'{loc}")
+
+
 def moving_average(a, window_size):
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
@@ -83,7 +111,7 @@ def compute_advantage(gamma, lmbda, td_delta):
         advantage = gamma * lmbda * advantage + delta
         advantage_list.append(advantage)
     advantage_list.reverse()
-    return torch.tensor(advantage_list, dtype=torch.float)
+    return torch.tensor(np.array(advantage_list), dtype=torch.float)
 
 
 class ValueNet(torch.nn.Module):
@@ -117,6 +145,7 @@ class SquashedNormal:
         self.std = std
         self.normal = Normal(mu, std)
         self.eps = eps
+        self.mean = mu
 
     def sample(self):
         # rsample 以支持 reparameterization 重参数化采样, 结果是可导的
@@ -131,7 +160,9 @@ class SquashedNormal:
         # 为数值稳定性添加小量
         log_prob_u = self.normal.log_prob(u)
         # jacobian term
-        jacobian = torch.log(1 - a.pow(2) + self.eps) # fixme 应该+还是-？
+        jacobian = 0 # 保存u的话就不需要该修正项
+        # jacobian = 2*(np.log(2.0)-u-F.softplus(-2*u))
+        # jacobian = torch.log(1 - a.pow(2) + self.eps)
         # sum over action dim, keep dims consistent: return (N, 1)
         # 取消提前求和 # return (log_prob_u - jacobian).sum(-1, keepdim=True)
         return log_prob_u - jacobian  # 返回形状为 (batch_size, action_dim)
@@ -162,11 +193,12 @@ class PolicyNetContinuous(torch.nn.Module):
         self.fc_mu = torch.nn.Linear(prev_size, action_dim)
         self.fc_std = torch.nn.Linear(prev_size, action_dim)
 
-    def forward(self, x, min_std=1e-3):
+    def forward(self, x, min_std=1e-6, max_std=0.3): # max_std=0.6
+        # 最小方差 1e-3, 最大方差不要超过0.707否则tanh后会出现双峰函数
         x = self.net(x)
         mu = self.fc_mu(x)
         std = F.softplus(self.fc_std(x))
-        std = torch.clamp(std, min=min_std)
+        std = torch.clamp(std, min=min_std, max=max_std)
         return mu, std
 
 
@@ -185,7 +217,7 @@ class PPOContinuous:
     '''
 
     def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
-                 lmbda, epochs, eps, gamma, device):
+                 lmbda, epochs, eps, gamma, device, k_entropy=0.01, critic_max_grad=2, actor_max_grad=2):
         self.actor = PolicyNetContinuous(state_dim, hidden_dim, action_dim).to(device)
         self.critic = ValueNet(state_dim, hidden_dim).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
@@ -196,49 +228,91 @@ class PPOContinuous:
         self.epochs = epochs
         self.eps = eps
         self.device = device
+        self.k_entropy = k_entropy
+        self.critic_max_grad=critic_max_grad
+        self.actor_max_grad=actor_max_grad
+    
+    def set_learning_rate(self, actor_lr=None, critic_lr=None):
+        """动态设置 actor 和 critic 的学习率"""
+        if actor_lr is not None:
+            for param_group in self.actor_optimizer.param_groups:
+                param_group['lr'] = actor_lr
+        if critic_lr is not None:
+            for param_group in self.critic_optimizer.param_groups:
+                param_group['lr'] = critic_lr    
 
     def _scale_action_to_exec(self, a, action_bounds):
         """把 normalized action a (in [-1,1]) 缩放到环境区间。
 
-        action_bounds 可以是：
-        - 单个数值：action_bound，表示对称区间 [-action_bound, action_bound]
-        - 长度为 2 的元组/列表 (amin, amax)
-        - 每步的数组，形状 (N, 2)
+        action_bounds: 形状为 (action_dim, 2) 的二维 NumPy 数组，
+                       每行对应 amin 和 amax。
         """
-        if isinstance(action_bounds, (int, float)):
-            # 对称区间
-            amin = -float(action_bounds)
-            amax = float(action_bounds)
+        action_bounds = torch.as_tensor(action_bounds, dtype=a.dtype, device=a.device)
+        if action_bounds.dim() == 2:
+            # 处理二维张量 (action_dim, 2)
+            amin = action_bounds[:, 0]
+            amax = action_bounds[:, 1]
+        elif action_bounds.dim() == 3:
+            # 处理三维张量 (batch, action_dim, 2)
+            amin = action_bounds[:, :, 0]
+            amax = action_bounds[:, :, 1]
         else:
-            amin, amax = action_bounds
-        amin = torch.as_tensor(amin, dtype=a.dtype, device=a.device)
-        amax = torch.as_tensor(amax, dtype=a.dtype, device=a.device)
+            raise ValueError("action_bounds 的维度必须是 2 或 3")
+        
         # a in (-1,1) -> scale to [amin, amax]
         return amin + (a + 1.0) * 0.5 * (amax - amin)
 
     def _unscale_exec_to_normalized(self, a_exec, action_bounds):
         """把执行动作 a_exec 反向归一化到 [-1,1]。
 
-        如果 action_bounds 是标量，视作对称区间 [-b, b]。
-        返回 normalized action (in (-1,1)).
+        action_bounds: 形状为 (action_dim, 2) 的二维 NumPy 数组，
+                       每行对应 amin 和 amax。
         """
-        if isinstance(action_bounds, (int, float)):
-            amin = -float(action_bounds)
-            amax = float(action_bounds)
+        action_bounds = torch.as_tensor(action_bounds, dtype=a_exec.dtype, device=a_exec.device)
+        if action_bounds.dim() == 2:
+            # 处理二维张量 (action_dim, 2)
+            amin = action_bounds[:, 0]
+            amax = action_bounds[:, 1]
+        elif action_bounds.dim() == 3:
+            # 处理三维张量 (batch, action_dim, 2)
+            amin = action_bounds[:, :, 0]
+            amax = action_bounds[:, :, 1]
         else:
-            amin, amax = action_bounds
-        amin = torch.as_tensor(amin, dtype=a_exec.dtype, device=a_exec.device)
-        amax = torch.as_tensor(amax, dtype=a_exec.dtype, device=a_exec.device)
+            raise ValueError("action_bounds 的维度必须是 2 或 3")
+        
         # 防止除以零
         span = (amax - amin)
         span = torch.where(span == 0, torch.tensor(1e-6, device=span.device, dtype=span.dtype), span)
         a = 2.0 * (a_exec - amin) / span - 1.0
         # numerical stability
         return a.clamp(-0.999999, 0.999999)
-
-    def take_action(self, state, action_bounds=1.0, explore=True):
-        state = torch.tensor([state], dtype=torch.float).to(self.device)
+    
+    # 对外接口（保证numpy输入和numpy输出）
+    def unscale_exec_to_normalized(self, a_exec, action_bounds):
+        """Public wrapper: accepts numpy or torch, returns numpy on CPU."""
+        a_exec_t = torch.as_tensor(a_exec, dtype=torch.float, device=self.device)
+        action_bounds_t = torch.as_tensor(action_bounds, dtype=torch.float, device=self.device)
+        a_norm_t = self._unscale_exec_to_normalized(a_exec_t, action_bounds_t)
+        return a_norm_t.cpu().numpy()
+    
+    def take_action(self, state, action_bounds, explore=True):
+        state = torch.tensor(np.array([state]), dtype=torch.float).to(self.device)
+        # 检查state中是否存在nan
+        if torch.isnan(state).any() or torch.isinf(state).any():
+            print('state', state)
+        # 检查actor参数中是否存在nan
+        check_weights_bias_nan(self.actor, "actor", "take action中")
         mu, std = self.actor(state)
+        # 检查mu, std是否含有nan
+        if torch.isnan(mu).any() or torch.isnan(std).any() or torch.isinf(mu).any() or torch.isinf(std).any():
+            print('mu', mu)
+            print('std', std)
+            raise ValueError(
+                f"NaN/Inf detected in actor outputs: mu_nan={torch.isnan(mu).any().item()}, "
+                f"std_nan={torch.isnan(std).any().item()}, mu_inf={torch.isinf(mu).any().item()}, "
+                f"std_inf={torch.isinf(std).any().item()}"
+            ) 
+
         dist = SquashedNormal(mu, std)
         if explore:
             a_norm, u = dist.sample()
@@ -248,68 +322,61 @@ class PPOContinuous:
             a_norm = torch.tanh(u)
 
         a_exec = self._scale_action_to_exec(a_norm, action_bounds)
-        return a_exec[0].cpu().detach().numpy().flatten()
+        return a_exec[0].cpu().detach().numpy().flatten(), u[0].cpu().detach().numpy().flatten()
     
 
-    def update(self, transition_dict, action_bounds=None):
+    def update(self, transition_dict, adv_normed=False):
         """更新函数兼容以下几种调用方式：
-        - 如果 action_bounds 是 None：期望 transition_dict 中包含 'action_bounds'，其形状为 (N,2) 或每步 (amin,amax)
+        - 如果 action_bounds 是 None: 期望 transition_dict 中包含 'action_bounds'，其形状为 (N,2) 或每步 (amin,amax)
         - 如果 action_bounds 是标量/二元元组/数组：作为全局固定区间使用
 
         transition_dict 必须包含 keys: 'states','actions','rewards','next_states','dones'
         当动作区间随步变化时，必须包含 'action_bounds' 与之对应。
-        存储的 'actions' 应当是环境执行动作 a_exec（未归一化）。
+        存储的 'actions' 应当是环境执行动作 (a_exec 未归一化）。
         """
-        states = torch.tensor(transition_dict['states'], dtype=torch.float).to(self.device)
-        actions_exec = torch.tensor(transition_dict['actions'], dtype=torch.float).to(self.device)
-        rewards = torch.tensor(transition_dict['rewards'], dtype=torch.float).view(-1, 1).to(self.device)
-        next_states = torch.tensor(transition_dict['next_states'], dtype=torch.float).to(self.device)
-        dones = torch.tensor(transition_dict['dones'], dtype=torch.float).view(-1, 1).to(self.device)
-
-        if action_bounds is None:
-            if 'action_bounds' in transition_dict:
-                action_bounds = transition_dict['action_bounds']
-            else:
-                action_bounds = 1.0  # 默认值
-
-        # 将 action_bounds 处理为每步的数组
-        if isinstance(action_bounds, (int, float)):
-            # 对称区间，扩展为每步相同的区间
-            # action_bounds_arr = [action_bounds] * len(transition_dict['actions'])
-            amin_list = [-float(action_bounds)] * len(transition_dict['actions'])
-            amax_list = [float(action_bounds)] * len(transition_dict['actions'])
-        elif isinstance(action_bounds, (tuple, list, np.ndarray)) and len(action_bounds) == 2:
-            # 二元元组或列表，扩展为每步相同的 min 和 max
-            amin_list = [float(action_bounds[0])] * len(transition_dict['actions'])
-            amax_list = [float(action_bounds[1])] * len(transition_dict['actions'])
-        else:
-            # 每步不同的区间，直接解包
-            amin_list = [float(ab[0]) if isinstance(ab, (tuple, list, np.ndarray)) else -float(ab) for ab in action_bounds]
-            amax_list = [float(ab[1]) if isinstance(ab, (tuple, list, np.ndarray)) else float(ab) for ab in action_bounds]
-
-        # 转换为张量
-        amin_tensor = torch.tensor(amin_list, dtype=actions_exec.dtype, device=self.device).unsqueeze(-1)
-        amax_tensor = torch.tensor(amax_list, dtype=actions_exec.dtype, device=self.device).unsqueeze(-1)
+        states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
+        u_s = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
+        rewards = torch.tensor(np.array(transition_dict['rewards']), dtype=torch.float).view(-1, 1).to(self.device)
+        next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
+        dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
+        action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
 
         # 计算 td_target, advantage
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
         td_delta = td_target - self.critic(states)
         advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
+        
+        # 优势归一化（目前只发现了阻碍）
+        if adv_normed:
+            adv_mean, adv_std = advantage.mean(), advantage.std(unbiased=False) 
+            advantage = (advantage - adv_mean) / (adv_std + 1e-8)
 
         # 策略输出（未压缩的 mu,std）
         mu, std = self.actor(states)
         # 构造 SquashedNormal 并计算 old_log_probs
         dist = SquashedNormal(mu.detach(), std.detach())
 
-        # 将执行动作反向归一化到 [-1,1]，以便计算 log_prob
-        actions_normalized = self._unscale_exec_to_normalized(actions_exec, (amin_tensor, amax_tensor))
+        # # 将执行动作反向归一化到 [-1,1]，以便计算 log_prob
+        # actions_normalized = self._unscale_exec_to_normalized(actions_exec, action_bounds)
         
-        # 反算 u = atanh(a)
-        u_old = torch.atanh(actions_normalized)
-        old_log_probs = dist.log_prob(actions_normalized, u_old)
+        # # 反算 u = atanh(a)
+        u_old = u_s
+        old_log_probs = dist.log_prob(0, u_old) # (N,1)
+
+        # # 提前在action_dim维度求和
+        # old_log_probs = dist.log_prob(0, u_old).sum(-1, keepdim=True)    # -> (N,1)
 
         if torch.isnan(old_log_probs).any():
             raise ValueError("old_log_probs 包含 NaN，检查 action_bounds 或 actions 的合法性")
+
+        actor_grad_list = []
+        actor_loss_list = []
+        critic_grad_list = []
+        post_clip_actor_grad = []
+        post_clip_critic_grad = []
+        critic_loss_list = []
+        entropy_list = []
+        ratio_list = []
 
         for _ in range(self.epochs):
             mu, std = self.actor(states)
@@ -319,15 +386,28 @@ class PPOContinuous:
             if torch.isnan(critic_values).any():
                 raise ValueError("NaN in Critic outputs in loop")
 
+            # 权重/偏置 NaN 检查（在每次前向后、反向前检查参数）
+            check_weights_bias_nan(self.actor, "actor", "update循环中")
+            check_weights_bias_nan(self.critic, "critic", "update循环中")
+
             dist = SquashedNormal(mu, std)
             # 计算当前策略对历史执行动作的 log_prob（使用同一个 u_old）
-            log_probs = dist.log_prob(actions_normalized, u_old)
+            log_probs = dist.log_prob(0, u_old) # (N,1)
 
-            ratio = torch.exp(log_probs - old_log_probs)
-            surr1 = ratio * advantage
+            # # 提前在action_dim维度求和
+            # log_probs = dist.log_prob(0, u_old).sum(-1, keepdim=True)   # -> (N,1)
+
+            ratio = torch.exp(log_probs - old_log_probs) # (N,1)
+            # surr1 = ratio * advantage
+            # calmp surr1
+            surr1 = torch.clamp(ratio, -20, 20) * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
             # 取消提前求和 # actor_loss = -torch.min(surr1, surr2).mean() - 0.1 * dist.entropy().mean()
-            actor_loss = -torch.min(surr1, surr2).sum(-1).mean() - 0.1 * dist.entropy().mean()
+
+            # 可选：对surr1用一个很大的范围去clamp防止出现一个很负的数
+
+            entropy_factor = torch.clamp(dist.entropy().mean(), -20, 70) # -20, 7 e^2
+            actor_loss = -torch.min(surr1, surr2).sum(-1).mean() - self.k_entropy * entropy_factor # 标量
             # ↑如果求和之和还要保留原先的张量维度，用torch.sum(torch.min(surr1,surr2),dim=-1,keepdim=True)
 
             critic_loss = F.mse_loss(self.critic(states), td_target.detach())
@@ -335,31 +415,38 @@ class PPOContinuous:
             self.critic_optimizer.zero_grad()
             actor_loss.backward()
             critic_loss.backward()
+            
+            # 裁剪前梯度
+            post_clip_actor_grad.append(model_grad_norm(self.actor))
+            post_clip_critic_grad.append(model_grad_norm(self.critic))  
 
             # 梯度裁剪
-            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=2)
-            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=2)
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=self.actor_max_grad)
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=self.critic_max_grad)
 
             self.actor_optimizer.step()
             self.critic_optimizer.step()
 
-
-# 注意：为了兼容原来的训练循环，请在构造 transition_dict 时保证：
-# - 'actions' 存储的是环境实际执行的动作 a_exec（未归一化）
-# - 如果动作区间随步变化，则 transition_dict['action_bounds'] 应为长度为步数的序列，
-#   其中每个元素是 (amin, amax) 或 标量 b（表示对称区间 [-b,b]）。
-# 示例：
-# transition = {
-#   'states': [...],
-#   'actions': [...],  # 执行到环境的动作
-#   'rewards': [...],
-#   'next_states': [...],
-#   'dones': [...],
-#   'action_bounds': [(amin0,amax0), (amin1,amax1), ...]  # 可选
-# }
-
-# 以上实现把 action_bounds 纳入了 update 的计算链路，从而保证了 log_prob 的计算与当时执行动作的一致性，
-# 避免了因动作裁剪/投影导致的策略-执行分布不匹配，从根本上缓解了你提到的 update 中梯度爆炸问题。
+            # # 保存用于日志/展示的数值（断开计算图并搬到 CPU）
+            actor_grad_list.append(model_grad_norm(self.actor))
+            actor_loss_list.append(actor_loss.detach().cpu().item())
+            critic_grad_list.append(model_grad_norm(self.critic))            
+            critic_loss_list.append(critic_loss.detach().cpu().item())
+            entropy_list.append(dist.entropy().mean().detach().cpu().item())
+            ratio_list.append(ratio.mean().detach().cpu().item())
+        
+        self.actor_loss = np.mean(actor_loss_list)
+        self.actor_grad = np.mean(actor_grad_list)
+        self.critic_loss = np.mean(critic_loss_list)
+        self.critic_grad = np.mean(critic_grad_list)
+        self.entropy_mean = np.mean(entropy_list)
+        self.ratio_mean = np.mean(ratio_list)
+        self.post_clip_critic_grad = np.mean(post_clip_critic_grad)
+        self.post_clip_actor_grad = np.mean(post_clip_actor_grad)
+        self.advantage = advantage.abs().mean().detach().cpu().item()
+        # 权重/偏置 NaN 检查（在每次前向后、反向前检查参数）
+        check_weights_bias_nan(self.actor, "actor", "update后")
+        check_weights_bias_nan(self.critic, "critic", "update后")
 
 
 # 超参数
@@ -406,18 +493,17 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
             max_action_bound = 3
 
             # 栏杆
+            max_action = max_action_bound # min(10-state[0], max_action_bound)
+            min_action = -max_action_bound # max(-10-state[0], -max_action_bound)
 
-            max_action = min(10-state[0], max_action_bound)
-            min_action = max(-10-state[0], -max_action_bound)
+            action_bound = [[min_action, max_action]]
 
-            action_bound = (min_action, max_action)
-
-            action = agent.take_action(state, action_bounds=action_bound, explore=True)
+            action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
 
             next_state, reward, done = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
             # print(reward)
             transition_dict['states'].append(state)
-            transition_dict['actions'].append(action)
+            transition_dict['actions'].append(u)
             transition_dict['next_states'].append(next_state)
             transition_dict['rewards'].append(reward)
             transition_dict['dones'].append(done)
@@ -456,6 +542,43 @@ plt.xlabel('Episodes')
 plt.ylabel('Returns')
 # plt.title('PPO on {}'.format(env_name))
 
-plt.show()
-
 print("出界次数：", out_range_count)
+
+
+# 测试回合
+ups = []
+track = []
+downs = []
+step = 0
+episode_return = 0
+state = env.reset()
+done = False
+while not done:  # 每个训练回合
+    step += 1
+    max_action_bound = 3
+
+    # 栏杆
+    max_action = max_action_bound # min(10-state[0], max_action_bound)
+    min_action = -max_action_bound # max(-10-state[0], -max_action_bound)
+    action_bound = [[min_action, max_action]]
+
+    action, _ = agent.take_action(state, action_bounds=action_bound, explore=False)
+    next_state, reward, done = env.step(action)
+    state = next_state
+    episode_return += reward
+
+    track.append((step, env.position[0]))
+    ups.append((step, env.max_pos))
+    downs.append((step, env.min_pos))
+
+times, pos_list = zip(*track)
+_, up_list = zip(*ups)
+_, down_list = zip(*downs)
+
+plt.figure()
+plt.plot(times, pos_list)
+plt.plot(times, up_list)
+plt.plot(times, down_list)
+plt.xlabel('Episodes')
+plt.ylabel('Returns')
+plt.show()
