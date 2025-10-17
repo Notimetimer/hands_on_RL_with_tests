@@ -1,72 +1,13 @@
-# 游标训练环境
-import random
-import matplotlib
-import matplotlib.pyplot as plt
-import gym
-from gym import spaces
-from numpy.linalg import norm
+'''
+注意：take action 有两个输出，即actor原始输出u和tanh和scale后的action_exec
+有监督预训练时经验池存 action_exec, 强化学习训练时经验池存 u
+'''
+
 from torch.distributions import Normal
-import random
 import numpy as np
-from tqdm import tqdm
-import collections
 import torch
 from torch import nn
 import torch.nn.functional as F
-
-# matplotlib.use('Qt5Agg')  # 使用Qt5作为后端
-
-class Env:
-    def __init__(self):
-        self.bounce_back = None
-        self.min_pos = -10
-        self.max_pos = 10
-        self.position = None
-        self.out_range = None
-
-    def reset(self):
-        self.position = np.array([random.randint(self.min_pos, self.max_pos)],dtype='float64')
-        self.steps=0
-        self.out_range = 0
-        return self.get_obs()
-
-    def get_obs(self):
-        # 返回 position 的副本，避免外部保存到 transition_dict 时成为引用
-        return self.position.copy()
-
-    def step(self, move):
-        self.bounce_back = 0
-        self.position += move # + np.random.normal()
-        if self.position < self.min_pos or self.position > self.max_pos:
-            self.bounce_back=1
-        # self.position = np.clip(self.position, self.min_pos, self.max_pos) # 栏杆
-
-        self.steps+=1
-        done = self.get_done()
-        reward = self.get_reward()
-        # print(reward)
-        return self.get_obs(), reward, done
-
-    def get_done(self):
-        done=0
-        if self.position < self.min_pos or self.position > self.max_pos:
-            done=1
-            self.out_range = 1
-        if self.steps>=20:
-            done=1
-        return done
-
-    def get_reward(self):
-        if self.min_pos <= self.position <= self.max_pos:
-            reward1 = 1 - np.linalg.norm(self.position - (self.max_pos + self.min_pos) / 2) / 10
-        else:
-            reward1 = 0 # -3
-        # if self.bounce_back:
-        #     reward1-=2
-        return reward1
-
-# 改进算法
-
 
 # 计算并记录 actor / critic 的梯度范数（L2）
 def model_grad_norm(model):
@@ -465,139 +406,140 @@ class PPOContinuous:
         check_weights_bias_nan(self.critic, "critic", "update后")
 
 
-# 超参数
-actor_lr = 1e-3 /10 # 1e-4 1e-6  # 2e-5 警告，学习率过大会出现"nan"
-critic_lr = actor_lr * 10  # 1e-3  9e-3  5e-3 为什么critic学习率大于一都不会梯度爆炸？ 为什么设置成1e-5 也会爆炸？ chatgpt说要actor的2~10倍
-num_episodes = 200 # fixme 如果不限制最小方差，500 的时候会梯度爆炸, 限制后1000 也会爆炸
-hidden_dims = [128]  # 128 fixme 层数大时actor梯度也会爆炸
-gamma = 0.9
-lmbda = 0.9
-epochs = 10  # 10 # fixme 4的时候也会梯度爆炸
-eps = 0.2
-device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-
-# env_name = 'testEnv'
-env = Env()
-random.seed(0)
-np.random.seed(0)
-# env.seed(0)
-torch.manual_seed(0)
-state_dim = 1
-action_dim = 1
 
 
-agent = PPOContinuous(state_dim, hidden_dims, action_dim, actor_lr, critic_lr,
-                      lmbda, epochs, eps, gamma, device)
-
-out_range_count = 0
-return_list = []
-clear_batch_flag=1
-with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
-    for i_episode in range(int(num_episodes)):  # 每个1/10的训练轮次
-        episode_return = 0
-        if clear_batch_flag:
-            transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': [], 'action_bounds': []}
-            clear_batch_flag=0
-        state = env.reset()
-        done = False
-        while not done:  # 每个训练回合
-            # state_check=state
-            # 1.执行动作得到环境反馈
-
-            # print('state', state, flush=True)
-            
-            max_action_bound = 3
-
-            # 栏杆
-            max_action = max_action_bound # min(10-state[0], max_action_bound)
-            min_action = -max_action_bound # max(-10-state[0], -max_action_bound)
-
-            action_bound = [[min_action, max_action]]
-
-            action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
-
-            next_state, reward, done = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
-            # print(reward)
-            transition_dict['states'].append(np.array(state, copy=True))
-            transition_dict['actions'].append(u)
-            transition_dict['next_states'].append(next_state)
-            transition_dict['rewards'].append(reward)
-            transition_dict['dones'].append(done)
-            transition_dict['action_bounds'].append(action_bound)
-            state = next_state
-            episode_return += reward
-        
-        if env.out_range==1:
-            out_range_count+=1
-        return_list.append(episode_return)
-        if 1: # len(transition_dict['dones'])>20: # 逐batch更新
-            agent.update(transition_dict, adv_normed=1)
-            clear_batch_flag=1
-        if (i_episode + 1) >= 10:
-            pbar.set_postfix({'episode': '%d' % (i_episode + 1),
-                              'return': '%.3f' % np.mean(return_list[-10:])})
-        pbar.update(1)
-    # return return_list
-
-# return_list = train_off_policy_agent(env, agent, num_episodes, replay_buffer, minimal_size, batch_size)
-
-# %matplotlib inline
-
-episodes_list = list(range(len(return_list)))
-plt.figure()
-plt.title("original")
-plt.plot(episodes_list, return_list)
-plt.xlabel('Episodes')
-plt.ylabel('Returns')
-# plt.title('PPO on {}'.format(env_name))
 
 
-mv_return = moving_average(return_list, 9)
-plt.figure()
-plt.title("original")
-plt.plot(episodes_list, mv_return)
-plt.xlabel('Episodes')
-plt.ylabel('Returns')
-# plt.title('PPO on {}'.format(env_name))
 
-print("出界次数：", out_range_count)
+    # 特殊用法
+    def update_actor_supervised(self, transition_dict):
+        """
+        Supervised update:
+        - Actor: 通过监督学习克隆经验池中的行为策略。具体地，用执行动作反归一化得到的 u_old = atanh(a_normalized)
+                 作为目标，最小化 actor 输出 mu 与 u_old 之间的 MSE（即拟合 pre-squash 均值）。
+        """
+        # 转换为 tensor（先用 np.array 以避免警告/性能问题）
+        states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
+        actions_exec = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
+        action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
+
+        # 将执行动作反向归一化到 [-1,1] 并计算 u_old = atanh(a)
+        actions_normalized = self._unscale_exec_to_normalized(actions_exec, action_bounds)
+        # u_old 作为监督目标（detach）
+        u_old = torch.atanh(actions_normalized).detach()
+
+        actor_grad_list = []
+        actor_loss_list = []
+        post_clip_actor_grad = []
+        # 训练若干轮：每轮先更新 critic（回归 td_target），再用监督信号更新 actor（拟合 u_old）
+        # 超参：目标 std 与权重（可改成 self.attr 并由构造函数传入）
+        target_std_value = 0.5
+        std_loss_weight = 1.0
+
+        for _ in range(self.epochs):
+            # Actor 监督学习：拟合 mu -> u_old，同时把 std 拉向目标值
+            mu, std = self.actor(states)
+            mse_mu = F.mse_loss(mu, u_old)  # 拟合 mu
+            # 为 std 构造目标张量并计算 MSE（std 已由网络经过 softplus/clamp）
+            std_target = torch.full_like(std, fill_value=target_std_value)
+            mse_std = F.mse_loss(std, std_target)
+            actor_loss = mse_mu + std_loss_weight * mse_std
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            post_clip_actor_grad.append(model_grad_norm(self.actor))
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=100)
+            self.actor_optimizer.step()
+
+            actor_grad_list.append(model_grad_norm(self.actor))
+            actor_loss_list.append(actor_loss.detach().cpu().item())
+
+        self.actor_loss = np.mean(actor_loss_list)
+        self.actor_grad = np.mean(actor_grad_list)
+        self.post_clip_actor_grad = np.mean(post_clip_actor_grad)
+    
+    def update_critic_only(self, transition_dict):
+        """
+        - Critic: 与 update() 中相同，使用 TD target 做回归。
+        """
+        # 转换为 tensor（先用 np.array 以避免警告/性能问题）
+        states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
+        # actions_exec = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
+        rewards = torch.tensor(np.array(transition_dict['rewards']), dtype=torch.float).view(-1, 1).to(self.device)
+        next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
+        dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
+        # action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
+
+        # 计算 td_target（与 update() 相同）
+        td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
+
+        critic_grad_list = []
+        critic_loss_list = []
+        post_clip_critic_grad = []
+
+        # 训练若干轮：每轮先更新 critic（回归 td_target），再用监督信号更新 actor（拟合 u_old）
+        for _ in range(self.epochs):
+            # Critic 更新（同 update）
+            critic_loss = F.mse_loss(self.critic(states), td_target.detach())
+            self.critic_optimizer.zero_grad()
+            critic_loss.backward()
+
+            # 裁剪前梯度
+            post_clip_critic_grad.append(model_grad_norm(self.critic)) 
+            # 梯度裁剪
+            nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=100)
+            self.critic_optimizer.step()
+
+            critic_grad_list.append(model_grad_norm(self.critic))            
+            critic_loss_list.append(critic_loss.detach().cpu().item())
+
+        self.critic_loss = np.mean(critic_loss_list)
+        self.critic_grad = np.mean(critic_grad_list)
+        self.post_clip_critic_grad = np.mean(post_clip_critic_grad)
 
 
-# 测试回合
-ups = []
-track = []
-downs = []
-step = 0
-episode_return = 0
-state = env.reset()
-done = False
-while not done:  # 每个训练回合
-    step += 1
-    max_action_bound = 3
 
-    # 栏杆
-    max_action = max_action_bound # min(10-state[0], max_action_bound)
-    min_action = -max_action_bound # max(-10-state[0], -max_action_bound)
-    action_bound = [[min_action, max_action]]
 
-    action, _ = agent.take_action(state, action_bounds=action_bound, explore=False)
-    next_state, reward, done = env.step(action)
-    state = next_state
-    episode_return += reward
+# 注意：为了兼容原来的训练循环，请在构造 transition_dict 时保证：
+# - 'actions' 存储的是环境实际执行的动作 a_exec（未归一化）
+# - 如果动作区间随步变化，则 transition_dict['action_bounds'] 应为长度为步数的序列，
+#   其中每个元素是 (amin, amax) 或 标量 b（表示对称区间 [-b,b]）。
+# 示例：
+# transition = {
+#   'states': [...],
+#   'actions': [...],  # 执行到环境的动作
+#   'rewards': [...],
+#   'next_states': [...],
+#   'dones': [...],
+#   'action_bounds': [(amin0,amax0), (amin1,amax1), ...]  # 可选
+# }
 
-    track.append((step, env.position[0]))
-    ups.append((step, env.max_pos))
-    downs.append((step, env.min_pos))
 
-times, pos_list = zip(*track)
-_, up_list = zip(*ups)
-_, down_list = zip(*downs)
+'''
+- 过程摘要（在 update() 里发生的事情）  
+  1. forward：actor(states) -> mu, std（std = softplus(fc_std(x)) 且被 clamp 到 [min_std, max_std]）  
+  2. 构造分布 SquashedNormal(mu,std)，计算 log_probs、ratio、surrogate objective 和 entropy 项目  
+  3. actor_loss = -E[min(surr1,surr2)] - k_entropy * entropy，随后 backward() 计算关于 mu 和 std 的梯度  
+  4. optimizer.step() 根据这些梯度更新 actor 的参数（包括产生 std 的 fc_std 层），因此 std 会被反向传播更新（除非对应参数没有梯度）
 
-plt.figure()
-plt.title("original")
-plt.plot(times, pos_list)
-plt.plot(times, up_list)
-plt.plot(times, down_list)
-plt.xlabel('Episodes')
-plt.ylabel('Returns')
-plt.show()
+- std 为什么会改变（从源头上看）  
+  - std 通过两条路径影响 actor_loss：  
+    a) log_prob（通过 ratio * advantage 的 surrogate）：对于每个样本 u_old，log_prob(u_old|mu,std) = -0.5*(u-mu)^2/std^2 - ln std + const。对 std 的偏导为 ( (u-mu)^2 / std^3 ) - 1/std 。  
+       - 该导数的符号依赖于样本是否在“一个 sigma 范围内”：当 (u-mu)^2 > std^2 （即 |u-mu| > std）时，导数为正 —— 增大 std 会增加该样本的 log_prob；反之当 |u-mu| < std 导数为负 —— 增大 std 会降低该样本的 log_prob。  
+       - surrogate 会以 advantage 加权：若 advantage>0，梯度会推动增加该样本的 log_prob；若 advantage<0，梯度会推动减少该样本的 log_prob。  
+    b) entropy 项：entropy( Normal(mu,std) ) 单调随 std 增大，因 actor_loss 包含 -k_entropy*entropy，entropy 项恒倾向于推动 std 增大（强度由 k_entropy 决定）。
+
+- 什么时候 std 会“增大”？  
+  - 当 entropy 项占主导（k_entropy 较大）时会整体推动 std 增大；或  
+  - 对于许多 advantage>0 的样本，如果这些样本的 |u-mu| > std（落在分布尾部），增加 std 会提升它们的 log_prob，从而被优化器采纳，导致 std 增大。
+
+- 什么时候 std 会“减小”？  
+  - 当为了提高对有利动作（advantage>0）的概率更有效的方法是把分布集中（把 mu 移向 u 或减小 std），即多数有利样本位于当前 σ 范围内（|u-mu| < std），那么梯度会推动 std 变小；或  
+  - 当 advantage<0 的样本较多时，优化会减少这些动作的概率，增加 std 有时会增加或减少 log_prob（取决于 |u-mu|），但通常将质量集中到好动作（减小 std）是常见结果。
+
+- 其他限制与注意  
+  - std 是通过 softplus(fc_std(x)) 参数化，softplus 的导数、小的 min_std 和 clamp 会限制极端变化（保证 >0、<=max_std）。  
+  - 实际变化由样本批次的统计（advantage 的符号与大小、(u-mu) 距离分布）和超参（actor lr、k_entropy、clip、batch size）共同决定。  
+  - 若你想控制 std 的行为：调节 k_entropy（增大鼓励更大 std）、或在 loss 中显式加入关于 std 的项（如对 std 的目标或正则）会更直接。
+
+简短结论：std 不是单一方向被“自动增大”或“自动减小”。它由 surrogate（ratio*advantage）和 entropy 两股力共同驱动，具体取向取决于样本 (u-mu) 相对 std 的位置、advantage 的符号/大小，以及 entropy 权重和其它超参。
+'''

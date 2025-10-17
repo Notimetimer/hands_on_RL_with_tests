@@ -57,13 +57,18 @@ class Env:
         return done
 
     def get_reward(self):
-        if self.min_pos <= self.position <= self.max_pos:
-            reward1 = 1 - np.linalg.norm(self.position - (self.max_pos + self.min_pos) / 2) / 10
-        else:
-            reward1 = 0 # -3
+        pos_opt = 9
+        reward1 = self.position[0]/10
+        # if self.min_pos <= self.position <= self.max_pos:
+        #     reward1 = 1 - np.linalg.norm(self.position - pos_opt) / 10
+        # else:
+        #     reward1 = 0 # -3
         # if self.bounce_back:
         #     reward1-=2
-        return reward1
+
+        if self.out_range:
+            reward1 -= 100
+        return reward1 - 1
 
 # 改进算法
 
@@ -351,10 +356,8 @@ class PPOContinuous:
         # 优势归一化
         if adv_normed:
             adv_mean, adv_std = advantage.detach().mean(), advantage.detach().std(unbiased=False) 
-            # advantage = torch.clamp((advantage - adv_mean) / (adv_std + 1e-8) -10.0, 10.0)
-            
-            # adv_mean, adv_std = advantage.mean(), advantage.std(unbiased=False) 
             advantage = (advantage - adv_mean) / (adv_std + 1e-8)
+            # advantage = torch.clamp((advantage - adv_mean) / (adv_std + 1e-8) -10.0, 10.0)
 
         # 提前计算一次旧的 value 预测（用于 value clipping）
         v_pred_old = self.critic(states).detach()  # (N,1)
@@ -370,7 +373,6 @@ class PPOContinuous:
         # # 反算 u = atanh(a)
         u_old = u_s
         old_log_probs = dist.log_prob(0, u_old) # (N,1)
-
         # 提前在action_dim维度求和
         old_log_probs = dist.log_prob(0, u_old).sum(-1, keepdim=True)    # -> (N,1)
 
@@ -468,7 +470,7 @@ class PPOContinuous:
 # 超参数
 actor_lr = 1e-3 /10 # 1e-4 1e-6  # 2e-5 警告，学习率过大会出现"nan"
 critic_lr = actor_lr * 10  # 1e-3  9e-3  5e-3 为什么critic学习率大于一都不会梯度爆炸？ 为什么设置成1e-5 也会爆炸？ chatgpt说要actor的2~10倍
-num_episodes = 200 # fixme 如果不限制最小方差，500 的时候会梯度爆炸, 限制后1000 也会爆炸
+num_episodes = 800 # fixme 如果不限制最小方差，500 的时候会梯度爆炸, 限制后1000 也会爆炸
 hidden_dims = [128]  # 128 fixme 层数大时actor梯度也会爆炸
 gamma = 0.9
 lmbda = 0.9
@@ -531,7 +533,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
             out_range_count+=1
         return_list.append(episode_return)
         if 1: # len(transition_dict['dones'])>20: # 逐batch更新
-            agent.update(transition_dict, adv_normed=1)
+            agent.update(transition_dict, adv_normed=0)
             clear_batch_flag=1
         if (i_episode + 1) >= 10:
             pbar.set_postfix({'episode': '%d' % (i_episode + 1),
