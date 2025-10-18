@@ -79,7 +79,7 @@ class Env:
         #     reward1-=2
 
         if self.out_range:
-            reward1 -= 100
+            reward1 -= 50 # 100
         return reward1 - 1
     
     def get_cost(self, action):
@@ -497,19 +497,21 @@ class PPOLagCont:
             # calmp surr1
             surr1 = torch.clamp(ratio, -20, 20) * advantage
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
-
-            # PPO-Lagrangian Actor 损失
-            # objective = -torch.min(surr1, surr2).sum(-1).mean()
-            # cost_objective = (ratio * cost_advantage).sum(-1).mean() # 注意，这里 cost_advantage 应该是非负的，或者直接使用成本
-
-            # 另一种 PPO-Lagrangian 的 Actor 损失形式，使用 lambda_cost
+            # 可选：对surr1用一个很大的范围去clamp防止出现一个很负的数
+            entropy_factor = dist.entropy().mean() # torch.clamp(dist.entropy().mean(), -20, 70) # -20, 7 e^2
             actor_loss_reward_term = -torch.min(surr1, surr2).sum(-1).mean()
-            actor_loss_cost_term = self.lambda_cost * (ratio * cost_advantage).sum(-1).mean()
 
-            ### test
-            actor_loss_cost_term = 0.0  # << 临时置 0 做对照
+            # PPO-Lagrangian Actor 损失            
+            # actor_loss_cost_term = self.lambda_cost * (ratio * cost_advantage).sum(-1).mean()
+            # ### test
+            # actor_loss_cost_term = 0.0  # << 临时置 0 做对照
+            # 把 cost 相关项从计算图中分离，避免影响 actor 的反向传播
+            actor_loss_cost_term = float(self.lambda_cost) * (ratio.detach() * cost_advantage.detach()).sum(-1).mean()
+#            actor_loss_cost_term = 0.0  # 屏蔽：不要删除，改为注释以便回溯
+            
+            actor_loss = actor_loss_reward_term - self.k_entropy * entropy_factor ###
 
-            actor_loss = actor_loss_reward_term + actor_loss_cost_term - self.k_entropy * dist.entropy().mean()
+            # actor_loss = actor_loss_reward_term + actor_loss_cost_term - self.k_entropy * entropy_factor
             # google AI 建议不对 ratio*cost_advatage 进行裁剪，因此没有事先将两个advantage合并
 
             # 计算 critic_loss：支持可选的 value clipping（PPO 风格）
@@ -612,16 +614,18 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 # env_name = 'testEnv'
 env = Env()
-random.seed(0)
-np.random.seed(0)
-# env.seed(0)
-torch.manual_seed(0)
+
 state_dim = 1
 action_dim = 1
 
 
 agent = PPOLagCont(state_dim, hidden_dims, action_dim, actor_lr, critic_lr, cost_critic_lr,
                       lmbda, epochs, eps, gamma, device, lambda_min=0, lambda_max=10.0)
+# 先创建网络对象再使用seed，否则随机数排序会有不一致
+random.seed(0)
+np.random.seed(0)
+# env.seed(0)
+torch.manual_seed(0)
 
 out_range_count = 0
 return_list = []
@@ -650,7 +654,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
 
             action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
 
-            next_state, reward, done, cost = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
+            next_state, reward, done, cost = env.step(action)
             # print(reward)
             transition_dict['states'].append(np.array(state, copy=True))
             transition_dict['actions'].append(u)

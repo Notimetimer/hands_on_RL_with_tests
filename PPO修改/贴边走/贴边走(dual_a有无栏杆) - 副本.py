@@ -15,6 +15,18 @@ from torch import nn
 import torch.nn.functional as F
 
 # matplotlib.use('Qt5Agg')  # 使用Qt5作为后端
+def softplus(x):
+    """
+    计算softplus函数值
+    
+    参数:
+    x -- 输入值（可以是标量、列表或NumPy数组）
+    
+    返回:
+    计算后的softplus值，与输入形状相同
+    """
+    x_np = np.asarray(x)  # 确保输入是NumPy数组
+    return np.log(1 + np.exp(x_np))
 
 class Env:
     def __init__(self):
@@ -44,8 +56,8 @@ class Env:
         self.steps+=1
         done = self.get_done()
         reward = self.get_reward()
-        # print(reward)
-        return self.get_obs(), reward, done
+        cost = self.get_cost(move) # 计算成本
+        return self.get_obs(), reward, done, cost
 
     def get_done(self):
         done=0
@@ -69,6 +81,26 @@ class Env:
         if self.out_range:
             reward1 -= 50 # 100
         return reward1 - 1
+    
+    def get_cost(self, action):
+        cost = -100000
+        # trigger = 3
+        # temp = 0
+
+        # # # 惩罚对边界的靠近程度
+        # # temp = min(np.linalg.norm(self.position - self.max_pos)/trigger, np.linalg.norm(self.position - self.min_pos)/trigger, 1)
+        # # cost = 1-temp
+
+        # # 惩罚靠近上边界还输出上的动作
+        # if self.position[0] > self.max_pos - trigger and action[0] > 0: # 假设边界区域为2个单位
+        #     temp = action[0] * (self.position[0] - (self.max_pos - trigger))/trigger # 离边界越近，惩罚越大
+        # # 惩罚靠近下边界还输出下的动作
+        # if self.position[0] < self.min_pos + trigger and action[0] < 0:
+        #     temp = abs(action[0]) * ((self.min_pos + trigger) - self.position[0])/trigger # 离边界越近，惩罚越大
+        # cost=temp
+        
+        return softplus(cost)
+
 
 # 改进算法
 
@@ -506,7 +538,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
     for i_episode in range(int(num_episodes)):  # 每个1/10的训练轮次
         episode_return = 0
         if clear_batch_flag:
-            transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': [], 'action_bounds': []}
+            transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'costs': [], 'dones': [], 'action_bounds': []}
             clear_batch_flag=0
         state = env.reset()
         done = False
@@ -526,12 +558,13 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
 
             action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
 
-            next_state, reward, done = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
+            next_state, reward, done, cost = env.step(action)
             # print(reward)
             transition_dict['states'].append(np.array(state, copy=True))
             transition_dict['actions'].append(u)
             transition_dict['next_states'].append(next_state)
             transition_dict['rewards'].append(reward)
+            transition_dict['costs'].append(cost)
             transition_dict['dones'].append(done)
             transition_dict['action_bounds'].append(action_bound)
             state = next_state
@@ -555,7 +588,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
 
 episodes_list = list(range(len(return_list)))
 plt.figure()
-plt.title("original")
+plt.title("Env Change")
 plt.plot(episodes_list, return_list)
 plt.xlabel('Episodes')
 plt.ylabel('Returns')
@@ -564,7 +597,7 @@ plt.ylabel('Returns')
 
 mv_return = moving_average(return_list, 9)
 plt.figure()
-plt.title("original")
+plt.title("Env Change")
 plt.plot(episodes_list, mv_return)
 plt.xlabel('Episodes')
 plt.ylabel('Returns')
@@ -591,7 +624,7 @@ while not done:  # 每个训练回合
     action_bound = [[min_action, max_action]]
 
     action, _ = agent.take_action(state, action_bounds=action_bound, explore=False)
-    next_state, reward, done = env.step(action)
+    next_state, reward, done, cost = env.step(action)
     state = next_state
     episode_return += reward
 
@@ -604,7 +637,7 @@ _, up_list = zip(*ups)
 _, down_list = zip(*downs)
 
 plt.figure()
-plt.title("original")
+plt.title("Env Change")
 plt.plot(times, pos_list)
 plt.plot(times, up_list)
 plt.plot(times, down_list)
