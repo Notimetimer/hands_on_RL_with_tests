@@ -83,21 +83,22 @@ class Env:
         return reward1 - 1
     
     def get_cost(self, action):
-        cost = -100000
-        # trigger = 3
-        # temp = 0
+        trigger = 3
+        temp = 0
+        
+        # cost = -100000     
 
-        # # # 惩罚对边界的靠近程度
-        # # temp = min(np.linalg.norm(self.position - self.max_pos)/trigger, np.linalg.norm(self.position - self.min_pos)/trigger, 1)
-        # # cost = 1-temp
+        # # 惩罚对边界的靠近程度
+        # temp = min(np.linalg.norm(self.position - self.max_pos)/trigger, np.linalg.norm(self.position - self.min_pos)/trigger, 1)
+        # cost = 1-temp
 
-        # # 惩罚靠近上边界还输出上的动作
-        # if self.position[0] > self.max_pos - trigger and action[0] > 0: # 假设边界区域为2个单位
-        #     temp = action[0] * (self.position[0] - (self.max_pos - trigger))/trigger # 离边界越近，惩罚越大
-        # # 惩罚靠近下边界还输出下的动作
-        # if self.position[0] < self.min_pos + trigger and action[0] < 0:
-        #     temp = abs(action[0]) * ((self.min_pos + trigger) - self.position[0])/trigger # 离边界越近，惩罚越大
-        # cost=temp
+        # 惩罚靠近上边界还输出上的动作
+        if self.position[0] > self.max_pos - trigger and action[0] > 0: # 假设边界区域为2个单位
+            temp = action[0] * (self.position[0] - (self.max_pos - trigger))/trigger # 离边界越近，惩罚越大
+        # 惩罚靠近下边界还输出下的动作
+        if self.position[0] < self.min_pos + trigger and action[0] < 0:
+            temp = abs(action[0]) * ((self.min_pos + trigger) - self.position[0])/trigger # 离边界越近，惩罚越大
+        cost=temp
         
         return softplus(cost)
 
@@ -502,17 +503,19 @@ class PPOLagCont:
             actor_loss_reward_term = -torch.min(surr1, surr2).sum(-1).mean()
 
             # PPO-Lagrangian Actor 损失            
-            # actor_loss_cost_term = self.lambda_cost * (ratio * cost_advantage).sum(-1).mean()
+            actor_loss_cost_term = self.lambda_cost * (ratio * cost_advantage).sum(-1).mean()
             # ### test
             # actor_loss_cost_term = 0.0  # << 临时置 0 做对照
             # 把 cost 相关项从计算图中分离，避免影响 actor 的反向传播
-            actor_loss_cost_term = float(self.lambda_cost) * (ratio.detach() * cost_advantage.detach()).sum(-1).mean()
+            # actor_loss_cost_term = float(self.lambda_cost) * (ratio.detach() * cost_advantage.detach()).sum(-1).mean()
 #            actor_loss_cost_term = 0.0  # 屏蔽：不要删除，改为注释以便回溯
             
-            actor_loss = actor_loss_reward_term - self.k_entropy * entropy_factor ###
+            # actor_loss = actor_loss_reward_term - self.k_entropy * entropy_factor ###
 
-            # actor_loss = actor_loss_reward_term + actor_loss_cost_term - self.k_entropy * entropy_factor
+            actor_loss = actor_loss_reward_term + actor_loss_cost_term - self.k_entropy * entropy_factor
             # google AI 建议不对 ratio*cost_advatage 进行裁剪，因此没有事先将两个advantage合并
+
+            # actor_loss = (1-self.lambda_cost) * actor_loss_reward_term + actor_loss_cost_term - self.k_entropy * entropy_factor
 
             # 计算 critic_loss：支持可选的 value clipping（PPO 风格）
             if clip_vf:
@@ -546,27 +549,27 @@ class PPOLagCont:
             self.critic_optimizer.step()
             self.cost_critic_optimizer.step() # 新增
 
+            ###
+
+            # # # 推荐：用实测 cost（或 episodic cost mean）来更新 lambda，而不是直接用 advantage 的均值
+            # # # 这里使用 batch 的 costs.mean() 作为 λ 的信号（更稳妥）
+            # empirical_cost_mean = float(costs.mean().item())
+            # lambda_grad = empirical_cost_mean - self.target_cost
+            
             # # 更新 lambda_cost (Lagrangian 乘子)
             # # lambda_cost 的梯度是 (cost_mean - target_cost)
             # # 我们希望 lambda_cost 增加以惩罚更高的成本，所以是 (cost_mean - target_cost)
-            # with torch.no_grad():
-            #     current_cost_mean = (cost_advantage).mean().item()
-            # # print(f"current_cost_mean: {current_cost_mean}, target_cost: {self.target_cost}")
-            # lambda_grad = current_cost_mean - self.target_cost
+            with torch.no_grad():
+                current_cost_mean = (cost_advantage).mean().item()
+            # print(f"current_cost_mean: {current_cost_mean}, target_cost: {self.target_cost}")
+            lambda_grad = current_cost_mean - self.target_cost
 
-            ###
-
-            # 推荐：用实测 cost（或 episodic cost mean）来更新 lambda，而不是直接用 advantage 的均值
-            # 这里使用 batch 的 costs.mean() 作为 λ 的信号（更稳妥）
-            empirical_cost_mean = float(costs.mean().item())
-            lambda_grad = empirical_cost_mean - self.target_cost
-            
             # 由于 self.lambda_cost 是 requires_grad=True 的张量，可以直接对其进行梯度下降
             # (Lagrangian 乘子的更新是梯度上升，因为目标是最大化 Lagrangian 函数)
-            # torch.nn.utils.clip_grad_norm_([self.lambda_cost], max_norm=0.1) # 可选：裁剪lambda_cost的梯度
-            # self.lambda_cost.grad = torch.tensor(lambda_grad, device=self.device)
-            # self.nu_optimizer.step()
-            # self.nu_optimizer.zero_grad()
+            torch.nn.utils.clip_grad_norm_([self.lambda_cost], max_norm=0.1) # 可选：裁剪lambda_cost的梯度
+            self.lambda_cost.grad = torch.tensor(lambda_grad, device=self.device)
+            self.nu_optimizer.step()
+            self.nu_optimizer.zero_grad()
             
             # 更直接的更新方式，因为 lambda_cost 只有一个值
             self.lambda_cost.data.add_(self.nu_optimizer.param_groups[0]['lr'] * lambda_grad)
@@ -615,16 +618,20 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 # env_name = 'testEnv'
 env = Env()
 
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
+
 state_dim = 1
 action_dim = 1
 
 
 agent = PPOLagCont(state_dim, hidden_dims, action_dim, actor_lr, critic_lr, cost_critic_lr,
-                      lmbda, epochs, eps, gamma, device, lambda_min=0, lambda_max=10.0)
+                      lmbda, epochs, eps, gamma, device, lambda_min=0.01, lambda_max=0.99) # .1
+
 # 先创建网络对象再使用seed，否则随机数排序会有不一致
 random.seed(0)
 np.random.seed(0)
-# env.seed(0)
 torch.manual_seed(0)
 
 out_range_count = 0
@@ -677,6 +684,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
                               'return': '%.3f' % np.mean(return_list[-10:])})
         pbar.update(1)
     # return return_list
+        print(agent.lambda_cost.item())
 
 # return_list = train_off_policy_agent(env, agent, num_episodes, replay_buffer, minimal_size, batch_size)
 

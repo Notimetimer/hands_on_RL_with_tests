@@ -514,10 +514,11 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 # env_name = 'testEnv'
 env = Env()
-# random.seed(0)
-# np.random.seed(0)
-# # env.seed(0)
-# torch.manual_seed(0)
+
+random.seed(0)
+np.random.seed(0)
+torch.manual_seed(0)
+
 state_dim = 1
 action_dim = 1
 
@@ -528,7 +529,6 @@ agent = PPOContinuous(state_dim, hidden_dims, action_dim, actor_lr, critic_lr,
 # 先创建网络对象再使用seed，否则随机数排序会有不一致
 random.seed(0)
 np.random.seed(0)
-# env.seed(0)
 torch.manual_seed(0)
 
 out_range_count = 0
