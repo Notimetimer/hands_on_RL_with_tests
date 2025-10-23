@@ -467,7 +467,53 @@ class PPOContinuous:
         # 权重/偏置 NaN 检查（在每次前向后、反向前检查参数）
         check_weights_bias_nan(self.actor, "actor", "update后")
         check_weights_bias_nan(self.critic, "critic", "update后")
+    
+    # 特殊用法
+    def update_actor_supervised(self, tutorial_dict):
+        """
+        Supervised update:
+        - Actor: 通过监督学习克隆经验池中的行为策略。具体地，用执行动作反归一化得到的 u_old = atanh(a_normalized)
+                 作为目标，最小化 actor 输出 mu 与 u_old 之间的 MSE（即拟合 pre-squash 均值）。
+        """
+        # 转换为 tensor（先用 np.array 以避免警告/性能问题）
+        states = torch.tensor(np.array(tutorial_dict['states']), dtype=torch.float).to(self.device)
+        actions_exec = torch.tensor(np.array(tutorial_dict['actions']), dtype=torch.float).to(self.device)
+        action_bounds = torch.tensor(np.array(tutorial_dict['action_bounds']), dtype=torch.float).to(self.device)
 
+        # 将执行动作反向归一化到 [-1,1] 并计算 u_old = atanh(a)
+        actions_normalized = self._unscale_exec_to_normalized(actions_exec, action_bounds)
+        # u_old 作为监督目标（detach）
+        u_old = torch.atanh(actions_normalized).detach()
+
+        actor_grad_list = []
+        actor_loss_list = []
+        post_clip_actor_grad = []
+        # 训练若干轮：每轮先更新 critic（回归 td_target），再用监督信号更新 actor（拟合 u_old）
+        # 超参：目标 std 与权重（可改成 self.attr 并由构造函数传入）
+        target_std_value = 0.5
+        std_loss_weight = 1.0
+
+        for _ in range(self.epochs):
+            # Actor 监督学习：拟合 mu -> u_old，同时把 std 拉向目标值
+            mu, std = self.actor(states)
+            mse_mu = F.mse_loss(mu, u_old)  # 拟合 mu
+            # 为 std 构造目标张量并计算 MSE（std 已由网络经过 softplus/clamp）
+            std_target = torch.full_like(std, fill_value=target_std_value)
+            mse_std = F.mse_loss(std, std_target)
+            actor_loss = mse_mu + std_loss_weight * mse_std
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            post_clip_actor_grad.append(model_grad_norm(self.actor))
+            nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=100)
+            self.actor_optimizer.step()
+
+            actor_grad_list.append(model_grad_norm(self.actor))
+            actor_loss_list.append(actor_loss.detach().cpu().item())
+
+        self.actor_loss = np.mean(actor_loss_list)
+        self.actor_grad = np.mean(actor_grad_list)
+        self.post_clip_actor_grad = np.mean(post_clip_actor_grad)
+    
 
 # 超参数
 actor_lr = 1e-3 /10 # 1e-4 1e-6  # 2e-5 警告，学习率过大会出现"nan"
@@ -501,13 +547,19 @@ torch.manual_seed(0)
 
 out_range_count = 0
 return_list = []
-clear_batch_flag=1
+correction_limes_list = []
+clear_batch_flag = 1
+clear_correction_flag = 1
 with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
     for i_episode in range(int(num_episodes)):  # 每个1/10的训练轮次
         episode_return = 0
         if clear_batch_flag:
             transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': [], 'action_bounds': []}
             clear_batch_flag=0
+        if clear_correction_flag:
+            correction_dict = {'states': [], 'actions':[], 'action_bounds': []}
+            clear_correction_flag = 0
+
         state = env.reset()
         done = False
         while not done:  # 每个训练回合
@@ -518,15 +570,29 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
             
             max_action_bound = 3
 
-            # 栏杆
+            # 最大动作
             max_action = max_action_bound # min(10-state[0], max_action_bound)
             min_action = -max_action_bound # max(-10-state[0], -max_action_bound)
-            # 动作裁剪
-            action_bound = [[min_action, max_action]]
-            action_bound[0][0] = max(-max_action_bound, env.min_pos - state[0])
-            action_bound[0][1] = min(max_action_bound, env.max_pos - state[0])
+            
+            action_bound = [[min_action, max_action]]           
 
             action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
+
+
+            # 动作裁剪
+            action_corrected = 0
+            if action[0] + state[0] < env.min_pos:
+                action[0] = env.min_pos - state[0] + 0.5
+                action_corrected=1
+
+            if action[0] + state[0] > env.max_pos:
+                action[0] = env.max_pos - state[0] - 0.5
+                action_corrected=1
+            
+            if action_corrected:
+                correction_dict['states'].append(np.array(state, copy=True))
+                correction_dict['actions'].append(action)
+                correction_dict['action_bounds'].append(action_bound)
 
             next_state, reward, done = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
             # print(reward)
@@ -542,9 +608,15 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
         if env.out_range==1:
             out_range_count+=1
         return_list.append(episode_return)
+        correction_limes_list.append(len(correction_dict['actions']))
         if 1: # len(transition_dict['dones'])>20: # 逐batch更新
             agent.update(transition_dict, adv_normed=0)
-            clear_batch_flag=1
+            clear_batch_flag = 1
+
+        if len(correction_dict['actions'])>=1:
+            agent.update_actor_supervised(correction_dict)
+            clear_correction_flag = 1
+
         if (i_episode + 1) >= 10:
             pbar.set_postfix({'episode': '%d' % (i_episode + 1),
                               'return': '%.3f' % np.mean(return_list[-10:])})
@@ -572,6 +644,14 @@ plt.xlabel('Episodes')
 plt.ylabel('Returns')
 # plt.title('PPO on {}'.format(env_name))
 
+
+plt.figure()
+plt.title("original")
+plt.plot(episodes_list, correction_limes_list)
+plt.xlabel('Episodes')
+plt.ylabel('corrections')
+# plt.title('PPO on {}'.format(env_name))
+
 print("出界次数：", out_range_count)
 
 
@@ -590,12 +670,15 @@ while not done:  # 每个训练回合
     # 栏杆
     max_action = max_action_bound # min(10-state[0], max_action_bound)
     min_action = -max_action_bound # max(-10-state[0], -max_action_bound)
-    # 动作裁剪
+    
     action_bound = [[min_action, max_action]]
-    action_bound[0][0] = max(-max_action_bound, env.min_pos - state[0])
-    action_bound[0][1] = min(max_action_bound, env.max_pos - state[0])
-
+    
     action, _ = agent.take_action(state, action_bounds=action_bound, explore=False)
+
+    # 动作裁剪
+    # action_bound[0][0] = max(-max_action_bound, env.min_pos - state[0])
+    # action_bound[0][1] = min(max_action_bound, env.max_pos - state[0])
+
     next_state, reward, done = env.step(action)
     state = next_state
     episode_return += reward
