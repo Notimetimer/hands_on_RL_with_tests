@@ -58,7 +58,9 @@ class Env:
 
     def get_reward(self):
         pos_opt = 9
-        reward1 = self.position[0]/10
+        reward1 = (self.position[0]<=pos_opt)*(-(pos_opt-self.position[0])/pos_opt) + \
+                  (self.position[0]> pos_opt)*(-(self.position[0]-pos_opt)/pos_opt)
+        # reward1 = self.position[0]/10
         # if self.min_pos <= self.position <= self.max_pos:
         #     reward1 = 1 - np.linalg.norm(self.position - pos_opt) / 10
         # else:
@@ -581,27 +583,28 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
 
             # 动作裁剪
             action_corrected = 0
+            action_original = action.copy()
             if action[0] + state[0] < env.min_pos:
-                action[0] = env.min_pos - state[0] + 0.5
+                action[0] = env.min_pos - state[0] + 1
                 action_corrected=1
 
             if action[0] + state[0] > env.max_pos:
-                action[0] = env.max_pos - state[0] - 0.5
+                action[0] = env.max_pos - state[0] - 1
                 action_corrected=1
-            
-            if action_corrected:
-                correction_dict['states'].append(np.array(state, copy=True))
-                correction_dict['actions'].append(action)
-                correction_dict['action_bounds'].append(action_bound)
 
-            next_state, reward, done = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
-            # print(reward)
-            transition_dict['states'].append(np.array(state, copy=True))
-            transition_dict['actions'].append(u)
-            transition_dict['next_states'].append(next_state)
-            transition_dict['rewards'].append(reward)
-            transition_dict['dones'].append(done)
-            transition_dict['action_bounds'].append(action_bound)
+            # if action_corrected:
+            #     correction_dict['states'].append(np.array(state, copy=True))
+            #     correction_dict['actions'].append(action)
+            #     correction_dict['action_bounds'].append(action_bound)
+
+            next_state, reward, done = env.step(action)
+            if 1: # not action_corrected: # 1: # 
+                transition_dict['states'].append(np.array(state, copy=True))
+                transition_dict['actions'].append(u)
+                transition_dict['next_states'].append(next_state)
+                transition_dict['rewards'].append(reward)
+                transition_dict['dones'].append(done)
+                transition_dict['action_bounds'].append(action_bound)
             state = next_state
             episode_return += reward
         
@@ -609,13 +612,14 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
             out_range_count+=1
         return_list.append(episode_return)
         correction_limes_list.append(len(correction_dict['actions']))
-        if 1: # len(transition_dict['dones'])>20: # 逐batch更新
-            agent.update(transition_dict, adv_normed=0)
-            clear_batch_flag = 1
 
         if len(correction_dict['actions'])>=1:
             agent.update_actor_supervised(correction_dict)
             clear_correction_flag = 1
+
+        if 1: # len(transition_dict['dones'])>20: # 逐batch更新
+            agent.update(transition_dict, adv_normed=0)
+            clear_batch_flag = 1
 
         if (i_episode + 1) >= 10:
             pbar.set_postfix({'episode': '%d' % (i_episode + 1),
@@ -676,8 +680,15 @@ while not done:  # 每个训练回合
     action, _ = agent.take_action(state, action_bounds=action_bound, explore=False)
 
     # 动作裁剪
-    # action_bound[0][0] = max(-max_action_bound, env.min_pos - state[0])
-    # action_bound[0][1] = min(max_action_bound, env.max_pos - state[0])
+    action_corrected = 0
+    action_original = action.copy()
+    if action[0] + state[0] < env.min_pos:
+        action[0] = env.min_pos - state[0] + 1
+        action_corrected=1
+
+    if action[0] + state[0] > env.max_pos:
+        action[0] = env.max_pos - state[0] - 1
+        action_corrected=1
 
     next_state, reward, done = env.step(action)
     state = next_state

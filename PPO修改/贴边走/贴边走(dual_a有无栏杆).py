@@ -58,7 +58,9 @@ class Env:
 
     def get_reward(self):
         pos_opt = 9
-        reward1 = self.position[0]/10
+        reward1 = (self.position[0]<=pos_opt)*(-(pos_opt-self.position[0])/pos_opt) + \
+                  (self.position[0]> pos_opt)*(-(self.position[0]-pos_opt)/pos_opt)
+        # reward1 = self.position[0]/10
         # if self.min_pos <= self.position <= self.max_pos:
         #     reward1 = 1 - np.linalg.norm(self.position - pos_opt) / 10
         # else:
