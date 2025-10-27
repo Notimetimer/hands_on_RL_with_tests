@@ -32,7 +32,8 @@ class Env:
 
     def get_obs(self):
         # 返回 position 的副本，避免外部保存到 transition_dict 时成为引用
-        return self.position.copy()
+        noise = np.random.normal(0, 0.2, size=self.position.shape)  # 添加高斯噪声
+        return self.position.copy() + noise
 
     def step(self, move):
         self.bounce_back = 0
@@ -70,7 +71,7 @@ class Env:
 
         if self.out_range:
             reward1 -= 50 # 100
-        return reward1 - 1
+        return reward1 + 1 # - 1
 
 # 改进算法
 
