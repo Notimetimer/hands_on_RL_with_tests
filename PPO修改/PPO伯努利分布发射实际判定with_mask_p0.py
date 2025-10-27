@@ -401,21 +401,36 @@ class PPO_bernouli:
             for param_group in self.critic_optimizer.param_groups:
                 param_group['lr'] = critic_lr    
 
-    def get_action_probs(self, state):
+    def get_action_probs(self, state, p0=None):
         """
         获取动作概率分布。
         :param state: 输入状态 (tensor)
+        :param p0: 初始概率 (numpy array 或 tensor)，用于调整 logits
         :return: 动作概率 (tensor)
         """
         logits = self.actor(state)  # 获取未经过 sigmoid 的 logits
-        probs = torch.sigmoid(logits)  # 应用 sigmoid 激活函数
-        return probs
+
+        # 默认 x0 为全零张量
+        x0 = torch.zeros_like(logits, dtype=logits.dtype, device=logits.device)
+
+        if p0 is not None:
+            # 确保 p0 是 tensor，并与 logits 的形状匹配
+            if not isinstance(p0, torch.Tensor):
+                p0 = torch.tensor(p0, dtype=torch.float).to(self.device)
+            p0 = p0.clamp(1e-6, 1 - 1e-6)  # 避免 log 运算时出现无穷大
+
+            # 计算 x0 = sigmoid^(-1)(p0)
+            x0 = -torch.log(torch.abs(1 / p0 - 1) + 1e-6)
+
+        probs = torch.sigmoid(logits + x0)  # 应用 sigmoid 激活函数
+        probs_original = torch.sigmoid(logits)
+        return probs, probs_original
 
     # take action
-    def take_action(self, state, explore=True, mask=None):
+    def take_action(self, state, explore=True, mask=None, p0=None):
         # state -> tensor (1, state_dim)
         state = torch.tensor(np.array([state]), dtype=torch.float).to(self.device)
-        probs = self.get_action_probs(state)  # 调用 get_action_probs 获取概率 (1,action_dim)
+        probs, probs_original = self.get_action_probs(state, p0=p0)  # (1,action_dim)
 
         if explore:
             sampled = torch.bernoulli(probs)  # (1, action_dim)
@@ -423,7 +438,7 @@ class PPO_bernouli:
             sampled = (probs >= 0.5).float()
 
         # to numpy arrays (flatten for probs, keep action as 1-D ndarray)
-        probs_np = probs.detach().cpu().numpy().flatten()           # shape (action_dim,)
+        probs_np = probs_original.detach().cpu().numpy().flatten()           # shape (action_dim,)
         actions_np = sampled.detach().cpu().numpy().reshape(-1)     # shape (action_dim,)
 
         # mask = np.array([[0,1]] * probs_np.shape[-1]) ###
@@ -436,18 +451,16 @@ class PPO_bernouli:
         return actions_np, probs_np
 
     def update(self, transition_dict, adv_normed=False, clip_vf=False, clip_range=0.2):
-        states = torch.tensor(transition_dict['states'], dtype=torch.float).to(self.device)
+        states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
         # actions 必须为 float，用于计算 log_prob
-        actions = torch.tensor(transition_dict['actions'], dtype=torch.float).to(self.device)
-        # # 统一 actions 形状为 (N, action_dim)
-        # if actions.dim() == 1:
-        #     actions = actions.unsqueeze(1)
+        actions = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
+        p0s = torch.tensor(np.array(transition_dict['p0s']), dtype=torch.float).to(self.device)
         rewards = torch.tensor(transition_dict['rewards'], dtype=torch.float).view(-1, 1).to(self.device)
-        next_states = torch.tensor(transition_dict['next_states'], dtype=torch.float).to(self.device)
+        next_states = torch.tensor((transition_dict['next_states']), dtype=torch.float).to(self.device)
         dones = torch.tensor(transition_dict['dones'], dtype=torch.float).view(-1, 1).to(self.device)
         
-        probs = self.get_action_probs(states)  # 调用 get_action_probs 获取概率
-        log_probs = torch.log(probs) * actions + torch.log(1 - probs) * (1 - actions)
+        _, probs_original = self.get_action_probs(states, p0=p0s)
+        log_probs = torch.log(probs_original) * actions + torch.log(1 - probs_original) * (1 - actions)
         log_probs = log_probs.sum(dim=1, keepdim=True)  # 对所有动作维度求和
         
         # 添加Actor NaN检查
@@ -470,8 +483,12 @@ class PPO_bernouli:
         # 提前计算一次旧的 value 预测（用于 value clipping）
         v_pred_old = self.critic(states).detach()  # (N,1)
 
-        old_probs = self.get_action_probs(states).detach()  # 调用 get_action_probs 获取概率
-        old_log_probs = torch.log(old_probs) * actions + torch.log(1 - old_probs) * (1 - actions)
+        # 解包 get_action_probs 的返回值
+        _, old_probs_original = self.get_action_probs(states, p0=p0s)
+        # old_probs = old_probs.detach()  # 对 old_probs 调用 detach()
+        old_probs_original = old_probs_original.detach()  # 对 old_probs_original 调用 detach()
+
+        old_log_probs = torch.log(old_probs_original) * actions + torch.log(1 - old_probs_original) * (1 - actions)
         old_log_probs = old_log_probs.sum(dim=1, keepdim=True).detach()
 
         actor_grad_list = []
@@ -484,8 +501,8 @@ class PPO_bernouli:
         ratio_list = []
 
         for _ in range(self.epochs):
-            probs = self.get_action_probs(states)  # 调用 get_action_probs 获取概率
-            log_probs = torch.log(probs) * actions + torch.log(1 - probs) * (1 - actions)
+            _, probs_original = self.get_action_probs(states, p0=p0s)
+            log_probs = torch.log(probs_original) * actions + torch.log(1 - probs_original) * (1 - actions)
             log_probs = log_probs.sum(dim=1, keepdim=True)
 
             # 添加Actor NaN检查
@@ -505,7 +522,7 @@ class PPO_bernouli:
             surr2 = torch.clamp(ratio, 1 - self.eps, 1 + self.eps) * advantage
 
             # 计算熵
-            entropy = - probs * torch.log(probs) - (1 - probs) * torch.log(1 - probs)
+            entropy = - probs_original * torch.log(probs_original) - (1 - probs_original) * torch.log(1 - probs_original)
             entropy_factor = entropy.sum(dim=1).mean()
 
             actor_loss = torch.mean(-torch.min(surr1, surr2)) - self.k_entropy * entropy_factor # 标量
@@ -569,7 +586,15 @@ if __name__ == '__main__':
                      epochs, eps, gamma, device)
     
     return_list = []
-    transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': []}    
+    transition_dict = {
+        'states': [],
+        'actions': [],
+        'next_states': [],
+        'rewards': [],
+        'dones': [],
+        'p0s': []  # 添加 'p0s' 键
+    }
+
     for ep in range(num_episodes):
         episode_return = 0
         
@@ -587,8 +612,13 @@ if __name__ == '__main__':
             dist = obs[0] * 10
             if dist > 80:
                 mask = np.array([[0,0]])
+                p0 = 0.0 # 基础发射概率
             if dist <= 20:
                 mask = np.array([[1,1]])
+                p0 = 1.0 # 基础发射概率
+            else:
+                p0 = 0.0 # 1-(dist-20)/(80-20)
+                
 
             action, _ = agent.take_action(obs, explore=1)
             next_obs, reward, terminated, truncated, info = env.step(action)
@@ -597,6 +627,7 @@ if __name__ == '__main__':
             transition_dict['next_states'].append(next_obs)
             transition_dict['rewards'].append(reward)
             transition_dict['dones'].append(terminated)
+            transition_dict['p0s'].append(p0)
             total_reward += reward
             step_count += 1
             
@@ -612,7 +643,14 @@ if __name__ == '__main__':
 
         if 1: # ep % 1 == 0:
             agent.update(transition_dict, adv_normed=0)
-            transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': []}    
+            transition_dict = {
+                'states': [],
+                'actions': [],
+                'next_states': [],
+                'rewards': [],
+                'dones': [],
+                'p0s': []  # 添加 'p0s' 键
+            }   
 
         print(f"Episode finished after {step_count} steps. Final reward: {total_reward:.2f}")
         print(f"Final state: Hits={info['hits']}, Arrows Left={info['arrows_left']}")
