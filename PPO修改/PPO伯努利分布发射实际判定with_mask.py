@@ -61,7 +61,7 @@ class ArcherEnv(gymn.Env):
         self.hits_to_win = 5           # 获胜所需命中数
 
         # --- 时间步长 ---
-        self.decision_dt = 0.5        # 决策步长 (s)
+        self.decision_dt = 1        # 决策步长 (s)
         self.physics_dt = self.decision_dt # 0.1    # 物理模拟步长 (s)
         self.physics_steps_per_decision = int(self.decision_dt / self.physics_dt)
 
@@ -417,6 +417,12 @@ class PPO_bernouli:
         probs_np = probs.detach().cpu().numpy().flatten()           # shape (action_dim,)
         actions_np = sampled.detach().cpu().numpy().reshape(-1)     # shape (action_dim,)
 
+        # mask = np.array([[0,1]] * probs_np.shape[-1]) ###
+        if mask is not None:
+            actions_np = np.clip(actions_np, mask[:, 0], mask[:, 1])
+            # for i, action in enumerate(actions_np):
+            #     actions_np[i] = np.clip(action, mask[i][0], mask[i][1])
+
         # 如果 action_dim == 1，保持返回形状为 (1,) 而不是 python int
         return actions_np, probs_np
 
@@ -568,7 +574,13 @@ if __name__ == '__main__':
         
         while not terminated:
             obs = env.get_obs()
-            # 随机策略：有15%的几率射击
+            mask = np.array([[0,1]] * action_dim)
+            dist = obs[0] * 10
+            if dist > 80:
+                mask = np.array([[0,0]])
+            if dist <= 20:
+                mask = np.array([[1,1]])
+
             action, _ = agent.take_action(obs, explore=1)
             next_obs, reward, terminated, truncated, info = env.step(action)
             transition_dict['states'].append(obs)
@@ -621,6 +633,13 @@ if __name__ == '__main__':
     while not terminated:
         steps += 1
         obs = env.get_obs()
+        mask = np.array([[0,1]] * action_dim)
+        dist = obs[0] * 10
+        if dist > 80:
+            mask = np.array([[0,0]])
+        if dist <= 20:
+            mask = np.array([[1,1]])
+
         action, _ = agent.take_action(obs, explore=0)
         next_obs, reward, terminated, truncated, info = env.step(action)
         total_reward += reward
