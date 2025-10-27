@@ -16,7 +16,7 @@ from torch import nn
 # 超参数
 actor_lr = 1e-3
 critic_lr = 1e-2
-num_episodes = 500 # 500
+num_episodes = 200 # 500
 hidden_dim = [128]
 gamma = 0.98
 lmbda = 0.95
@@ -27,7 +27,7 @@ device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cp
 
 class ArcherEnv(gymn.Env):
     """
-    弓箭手射击移动目标的环境。
+    枪手射击移动目标的环境。
 
     - **观测空间 (Observation Space)**: 3维Box
         1. [0] 与目标的距离 (m)
@@ -41,8 +41,7 @@ class ArcherEnv(gymn.Env):
     - **奖励 (Reward)**:
         - 获胜: +20
         - 失败: -20
-        - 每射一箭: -0.5
-        - 快速射击奖励: (5 - 射击间隔) / 5，仅当间隔 < 5s
+        
 
     - **终止条件 (Termination)**:
         - 射中5箭 (获胜)
@@ -57,13 +56,13 @@ class ArcherEnv(gymn.Env):
         # --- 环境参数 ---
         self.initial_distance = 100.0  # 初始距离 (m)
         self.target_speed = 4.0        # 目标速度 (m/s)
-        self.min_safe_distance = 2.0   # 弓箭手失败的最小距离 (m)
+        self.min_safe_distance = 2.0   # 枪手失败的最小距离 (m)
         self.total_arrows = 10         # 初始箭数
         self.hits_to_win = 5           # 获胜所需命中数
 
         # --- 时间步长 ---
-        self.decision_dt = 1.0         # 决策步长 (s)
-        self.physics_dt = 0.1          # 物理模拟步长 (s)
+        self.decision_dt = 1        # 决策步长 (s)
+        self.physics_dt = self.decision_dt # 0.1    # 物理模拟步长 (s)
         self.physics_steps_per_decision = int(self.decision_dt / self.physics_dt)
 
         # --- 命中率参数 ---
@@ -89,7 +88,7 @@ class ArcherEnv(gymn.Env):
 
     def get_obs(self):
         return np.array([
-            self.target_pos,
+            self.target_pos / 10,
             self.time_since_last_shot,
             self.arrows_left
         ], dtype=np.float32)
@@ -138,9 +137,9 @@ class ArcherEnv(gymn.Env):
         shoot_action = (action == 1)
         if shoot_action and self.arrows_left > 0:
             # a. 计算射击奖励
-            reward -= 0.5  # 每射一箭的固定惩罚
-            if self.time_since_last_shot < 5.0:
-                reward += (5.0 - self.time_since_last_shot) / 5.0
+            # reward -= 0.5  # 每射一箭的固定惩罚 ###
+            # if self.time_since_last_shot < 5.0:
+            #     reward += (self.time_since_last_shot) / 5.0
 
             # b. 判定是否命中
             distance_at_shot = self.target_pos
@@ -149,9 +148,14 @@ class ArcherEnv(gymn.Env):
                 hit_prob = 1.0
             else:
                 hit_prob = math.exp(-self.hit_decay_k * (distance_at_shot - self.guaranteed_hit_range))
+            # if distance_at_shot <= 70:
+            #     hit_prob = 1.0
+            # else:
+            #     hit_prob = 0.0
             
-            if self.np_random.random() < hit_prob:
+            if self.np_random.random() < hit_prob: # 如果命中
                 self.hits += 1
+                reward += 2 # * np.clip(distance_at_shot/100, 0, 1)
                 # 可视化：添加一个表示命中的标记
                 if self.render_mode == "human":
                     self.projectiles.append({"pos": distance_at_shot, "hit": True})
@@ -164,11 +168,12 @@ class ArcherEnv(gymn.Env):
             self.time_since_last_shot = 0.0
         
         # --- 2. 模拟世界演进 ---
-        # 一个决策步包含多个物理步
-        for _ in range(self.physics_steps_per_decision):
-            if not terminated: # 如果已结束，则不再移动目标
-                self.target_pos -= self.target_speed * self.physics_dt
-                self.target_pos = max(0, self.target_pos) # 防止穿过弓箭手
+        # # 一个决策步包含多个物理步
+        # for _ in range(self.physics_steps_per_decision):
+        #     if not terminated: # 如果已结束，则不再移动目标
+        #         self.target_pos -= self.target_speed * self.physics_dt
+        #         self.target_pos = max(0, self.target_pos) # 防止穿过枪手
+        self.target_pos -= self.target_speed * self.decision_dt
 
         self.time_since_last_shot += self.decision_dt
 
@@ -207,7 +212,7 @@ class ArcherEnv(gymn.Env):
         def to_px(pos_m):
             return int(50 + (pos_m / self.initial_distance) * 700)
 
-        # 绘制弓箭手 (绿色方块)
+        # 绘制枪手 (绿色方块)
         archer_px = to_px(0)
         pygame.draw.rect(self.screen, (0, 150, 0), (archer_px - 10, 100 - 20, 20, 40))
 
@@ -544,9 +549,10 @@ if __name__ == '__main__':
                      epochs, eps, gamma, device)
     
     return_list = []
+    transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': []}    
     for ep in range(num_episodes):
         episode_return = 0
-        transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': []}    
+        
         obs, info = env.reset()
         terminated = False
         done = terminated
@@ -568,15 +574,19 @@ if __name__ == '__main__':
             total_reward += reward
             step_count += 1
             
-            # 打印每一步的信息
-            print(
-                f"Step {step_count}: Action={action}, "
-                f"Dist={info['distance']:.1f}, "
-                f"Reward={reward:.2f}, "
-                f"Total Reward={total_reward:.2f}"
-            )
-            return_list.append(episode_return)
+            # # 打印每一步的信息
+            # print(
+            #     f"Step {step_count}: Action={action}, "
+            #     f"Dist={info['distance']:.1f}, "
+            #     f"Reward={reward:.2f}, "
+            #     f"Total Reward={total_reward:.2f}"
+            # )
+            episode_return += reward
+        return_list.append(episode_return)
+
+        if 1: # ep % 1 == 0:
             agent.update(transition_dict, adv_normed=0)
+            transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': []}    
 
         print(f"Episode finished after {step_count} steps. Final reward: {total_reward:.2f}")
         print(f"Final state: Hits={info['hits']}, Arrows Left={info['arrows_left']}")
@@ -607,4 +617,14 @@ if __name__ == '__main__':
         obs = env.get_obs()
         action, _ = agent.take_action(obs, explore=0)
         next_obs, reward, terminated, truncated, info = env.step(action)
+        total_reward += reward
+        print(
+                f"Step {steps}: Action={action}, "
+                f"Dist={info['distance']:.1f}, "
+                f"Reward={reward:.2f}"
+            )
+        time.sleep(0.5)
     env.close()
+    print(f"Episode finished after {steps} steps. Final reward: {total_reward:.2f}")
+    print(f"Final state: Hits={info['hits']}, Arrows Left={info['arrows_left']}")
+
