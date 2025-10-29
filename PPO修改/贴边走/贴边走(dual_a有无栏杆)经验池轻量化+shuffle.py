@@ -227,21 +227,10 @@ class PPOContinuous:
 
     def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
                  lmbda, epochs, eps, gamma, device, k_entropy=0.01, critic_max_grad=2, actor_max_grad=2, max_std=0.3):
-        # 保存 state_dim 以便 GRU 配置使用
-        self.state_dim = int(state_dim)
-
-        # actor / critic 网络（输入维默认与 state_dim 一致）
-        self.actor = PolicyNetContinuous(self.state_dim, hidden_dim, action_dim).to(device)
-        self.critic = ValueNet(self.state_dim, hidden_dim).to(device)
+        self.actor = PolicyNetContinuous(state_dim, hidden_dim, action_dim).to(device)
+        self.critic = ValueNet(state_dim, hidden_dim).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
-
-        # 共享 GRU 嵌入（默认不启用）。如需启用，调用 set_gru(...)
-        self.use_gru = False
-        self.shared_gru = None
-        self.gru_optimizer = None
-        self.gru_hidden_size = None
-        self.gru_num_layers = None
 
         self.gamma = gamma
         self.lmbda = lmbda
@@ -252,8 +241,7 @@ class PPOContinuous:
         self.critic_max_grad=critic_max_grad
         self.actor_max_grad=actor_max_grad
         self.max_std = max_std
-        # 若希望默认启用 GRU，可在此处调用 self.set_gru(True)（默认 hidden_size==state_dim）
-
+    
     def set_learning_rate(self, actor_lr=None, critic_lr=None):
         """动态设置 actor 和 critic 的学习率"""
         if actor_lr is not None:
@@ -262,32 +250,6 @@ class PPOContinuous:
         if critic_lr is not None:
             for param_group in self.critic_optimizer.param_groups:
                 param_group['lr'] = critic_lr    
-
-    def set_gru(self, enabled=True, gru_hidden_size=None, gru_num_layers=1, gru_lr=None):
-        """启用/配置共享 GRU embedding 层（actor & critic 共用）。
-        - enabled: 是否启用
-        - gru_hidden_size: 输出 embedding 维度，默认等于 state_dim（这样无需修改 actor/critic 输入）
-        - gru_num_layers: GRU 层数
-        - gru_lr: 如果为 None，则使用 actor_lr（不保存 actor_lr ，需显式传入），否则使用该学习率创建 gru_optimizer
-        注意：若将 gru_hidden_size 改为不等于 state_dim，你需要同时修改 actor/critic 的输入维以匹配 embedding。
-        """
-        self.use_gru = bool(enabled)
-        if not self.use_gru:
-            self.shared_gru = None
-            self.gru_optimizer = None
-            return
-
-        if gru_hidden_size is None:
-            gru_hidden_size = self.state_dim
-        self.gru_hidden_size = int(gru_hidden_size)
-        self.gru_num_layers = int(gru_num_layers)
-
-        # 创建共享 GRU（batch_first=True，输入维为 state_dim）
-        self.shared_gru = nn.GRU(input_size=self.state_dim, hidden_size=self.gru_hidden_size,
-                                 num_layers=self.gru_num_layers, batch_first=True).to(self.device)
-        # 创建 GRU 优化器（若传入 gru_lr 则使用，否则与 actor_optimizer lr 保持独立，如果 None 则用 critic lr）
-        use_lr = gru_lr if (gru_lr is not None) else (self.actor_optimizer.param_groups[0]['lr'])
-        self.gru_optimizer = torch.optim.Adam(self.shared_gru.parameters(), lr=use_lr)
 
     def _scale_action_to_exec(self, a, action_bounds):
         """把 normalized action a (in [-1,1]) 缩放到环境区间。
@@ -344,21 +306,13 @@ class PPOContinuous:
         return a_norm_t.cpu().numpy()
     
     def take_action(self, state, action_bounds, explore=True):
-        state = torch.tensor(np.array([state]), dtype=torch.float).to(self.device)  # (1, state_dim)
+        state = torch.tensor(np.array([state]), dtype=torch.float).to(self.device)
         # 检查state中是否存在nan
         if torch.isnan(state).any() or torch.isinf(state).any():
             print('state', state)
         # 检查actor参数中是否存在nan
         check_weights_bias_nan(self.actor, "actor", "take action中")
-        # 若启用共享 GRU，先把 state 视为长度为 1 的序列通过 GRU，得到 embedding 作为 actor 输入
-        if self.use_gru and (self.shared_gru is not None):
-            seq = state.unsqueeze(1)  # (batch=1, seq_len=1, input_size=state_dim)
-            gru_out, _ = self.shared_gru(seq)  # (1,1,gru_hidden)
-            state_emb = gru_out[:, -1, :]      # (1, gru_hidden)
-        else:
-            state_emb = state
-
-        mu, std = self.actor(state_emb, min_std=1e-6, max_std=self.max_std)
+        mu, std = self.actor(state, min_std=1e-6, max_std=self.max_std)
         # 检查mu, std是否含有nan
         if torch.isnan(mu).any() or torch.isnan(std).any() or torch.isinf(mu).any() or torch.isinf(std).any():
             print('mu', mu)
@@ -381,7 +335,7 @@ class PPOContinuous:
         return a_exec[0].cpu().detach().numpy().flatten(), u[0].cpu().detach().numpy().flatten()
     
 
-    def update(self, transition_dict, adv_normed=False, clip_vf=False, clip_range=0.2):
+    def update(self, transition_dict, adv_normed=False, clip_vf=False, clip_range=0.2, shuffled=1):
         """更新函数兼容以下几种调用方式：
         - 如果 action_bounds 是 None: 期望 transition_dict 中包含 'action_bounds'，其形状为 (N,2) 或每步 (amin,amax)
         - 如果 action_bounds 是标量/二元元组/数组：作为全局固定区间使用
@@ -390,29 +344,20 @@ class PPOContinuous:
         当动作区间随步变化时，必须包含 'action_bounds' 与之对应。
         存储的 'actions' 应当是环境执行动作 (a_exec 未归一化）。
         """
-        states = torch.tensor(np.array(transition_dict['states']), dtype=torch.float).to(self.device)
-        u_s = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
-        rewards = torch.tensor(np.array(transition_dict['rewards']), dtype=torch.float).view(-1, 1).to(self.device)
-        next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
-        dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
-        action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
+        indices = np.arange(len(transition_dict['states']))
+        if shuffled:
+            np.random.shuffle(indices)
 
-        # 若启用共享 GRU，将 states/next_states 视为序列长度=1 送入 GRU，得到 embedding 作为 actor/critic 的输入
-        if self.use_gru and (self.shared_gru is not None):
-            seq_states = states.unsqueeze(1)    # (N,1,state_dim)
-            seq_next = next_states.unsqueeze(1) # (N,1,state_dim)
-            # 不要用 no_grad，这样 GRU 的参数也能被训练（由 self.gru_optimizer 控制）
-            out_states, _ = self.shared_gru(seq_states)   # (N,1,gru_hidden)
-            out_next, _ = self.shared_gru(seq_next)
-            states_emb = out_states[:, -1, :]    # (N,gru_hidden)
-            next_states_emb = out_next[:, -1, :] # (N,gru_hidden)
-        else:
-            states_emb = states
-            next_states_emb = next_states
+        states = torch.tensor(np.array(transition_dict['states'])[indices], dtype=torch.float).to(self.device)
+        u_s = torch.tensor(np.array(transition_dict['actions'])[indices], dtype=torch.float).to(self.device)
+        rewards = torch.tensor(np.array(transition_dict['rewards'])[indices], dtype=torch.float).view(-1, 1).to(self.device)
+        next_values = torch.tensor(np.array(transition_dict['next_values'])[indices], dtype=torch.float).to(self.device)
+        dones = torch.tensor(np.array(transition_dict['dones'])[indices], dtype=torch.float).view(-1, 1).to(self.device)
+        # action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
 
-        # 计算 td_target, advantage（使用 embedding）
-        td_target = rewards + self.gamma * self.critic(next_states_emb) * (1 - dones)
-        td_delta = td_target - self.critic(states_emb)
+        # 计算 td_target, advantage
+        td_target = rewards + self.gamma * next_values.to(self.device) * (1 - dones)
+        td_delta = td_target - self.critic(states)
         advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
         
         # 优势归一化
@@ -424,8 +369,8 @@ class PPOContinuous:
         # 提前计算一次旧的 value 预测（用于 value clipping）
         v_pred_old = self.critic(states).detach()  # (N,1)
 
-        # 策略输出（未压缩的 mu,std）使用 embedding 作为输入
-        mu, std = self.actor(states_emb, min_std=1e-6, max_std=self.max_std)
+        # 策略输出（未压缩的 mu,std）
+        mu, std = self.actor(states, min_std=1e-6, max_std=self.max_std)
         # 构造 SquashedNormal 并计算 old_log_probs
         dist = SquashedNormal(mu.detach(), std.detach())
 
@@ -451,10 +396,10 @@ class PPOContinuous:
         ratio_list = []
 
         for _ in range(self.epochs):
-            mu, std = self.actor(states_emb, min_std=1e-6, max_std=self.max_std)
+            mu, std = self.actor(states, min_std=1e-6, max_std=self.max_std)
             if torch.isnan(mu).any() or torch.isnan(std).any():
                 raise ValueError("NaN in Actor outputs in loop")
-            critic_values = self.critic(states_emb)
+            critic_values = self.critic(states)
             if torch.isnan(critic_values).any():
                 raise ValueError("NaN in Critic outputs in loop")
 
@@ -485,22 +430,17 @@ class PPOContinuous:
 
             # 计算 critic_loss：支持可选的 value clipping（PPO 风格）
             if clip_vf:
-                v_pred = self.critic(states_emb)                              # 当前预测 (N,1)
+                v_pred = self.critic(states)                                  # 当前预测 (N,1)
                 v_pred_clipped = torch.clamp(v_pred, v_pred_old - clip_range, v_pred_old + clip_range)
                 vf_loss1 = (v_pred - td_target.detach()).pow(2)               # (N,1)
                 vf_loss2 = (v_pred_clipped - td_target.detach()).pow(2)       # (N,1)
                 critic_loss = torch.max(vf_loss1, vf_loss2).mean()
             else:
-                critic_loss = F.mse_loss(self.critic(states_emb), td_target.detach())
+                critic_loss = F.mse_loss(self.critic(states), td_target.detach())
 
-            # 零梯度（包含 GRU 的梯度若启用）
             self.actor_optimizer.zero_grad()
             self.critic_optimizer.zero_grad()
-            if self.use_gru and (self.shared_gru is not None) and (self.gru_optimizer is not None):
-                self.gru_optimizer.zero_grad()
-
-            # 反向传播（GRU 的参数会被包含进来，因为 states_emb 是通过 shared_gru 得到的）
-            actor_loss.backward(retain_graph=True)
+            actor_loss.backward()
             critic_loss.backward()
             
             # 裁剪前梯度
@@ -510,13 +450,9 @@ class PPOContinuous:
             # 梯度裁剪
             nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=self.actor_max_grad)
             nn.utils.clip_grad_norm_(self.critic.parameters(), max_norm=self.critic_max_grad)
-            if self.use_gru and (self.shared_gru is not None):
-                nn.utils.clip_grad_norm_(self.shared_gru.parameters(), max_norm=self.critic_max_grad)
 
             self.actor_optimizer.step()
             self.critic_optimizer.step()
-            if self.use_gru and (self.shared_gru is not None) and (self.gru_optimizer is not None):
-                self.gru_optimizer.step()
 
             # # 保存用于日志/展示的数值（断开计算图并搬到 CPU）
             actor_grad_list.append(model_grad_norm(self.actor))
@@ -577,7 +513,7 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
     for i_episode in range(int(num_episodes)):  # 每个1/10的训练轮次
         episode_return = 0
         if clear_batch_flag:
-            transition_dict = {'states': [], 'actions': [], 'next_states': [], 'rewards': [], 'dones': [], 'action_bounds': []}
+            transition_dict = {'states': [], 'actions': [], 'next_values': [], 'rewards': [], 'dones': []}
             clear_batch_flag=0
         state = env.reset()
         done = False
@@ -598,13 +534,14 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:  # 进度条
             action, u = agent.take_action(state, action_bounds=action_bound, explore=True)
 
             next_state, reward, done = env.step(action)  # pendulum中的action一定要是ndarray才能输入吗？
+            next_value = agent.critic(torch.tensor(next_state, dtype=torch.float32).to(device)).detach().cpu().numpy()
+
             # print(reward)
             transition_dict['states'].append(np.array(state, copy=True))
             transition_dict['actions'].append(u)
-            transition_dict['next_states'].append(next_state)
+            transition_dict['next_values'].append(next_value)
             transition_dict['rewards'].append(reward)
             transition_dict['dones'].append(done)
-            transition_dict['action_bounds'].append(action_bound)
             state = next_state
             episode_return += reward
         
