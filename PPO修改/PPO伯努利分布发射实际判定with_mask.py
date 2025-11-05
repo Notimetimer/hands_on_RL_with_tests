@@ -330,28 +330,6 @@ class ValueNet(torch.nn.Module):
         return self.fc_out(y)
 
 
-class PolicyNetDiscrete(torch.nn.Module):
-    def __init__(self, state_dim, hidden_dims, action_dim):
-        super(PolicyNetDiscrete, self).__init__()
-        self.prelu = torch.nn.PReLU()
-        layers = []
-        prev_size = state_dim
-        for layer_size in hidden_dims:
-            layers.append(nn.Linear(prev_size, layer_size))
-            # layers.append(self.prelu)
-            layers.append(nn.ReLU())
-            prev_size = layer_size
-        self.net = nn.Sequential(*layers)
-        self.fc_out = torch.nn.Linear(prev_size, action_dim)
-
-        # # 固定神经网络初始化参数
-        # torch.nn.init.xavier_normal_(self.fc_out.weight, gain=0.01)
-
-    def forward(self, x):
-        x = self.net(x)
-        return F.softmax(self.fc_out(x), dim=1)
-
-
 class PolicyNetBernouli(torch.nn.Module):
     def __init__(self, state_dim, hidden_dims, action_dim):
         super(PolicyNetBernouli, self).__init__()
