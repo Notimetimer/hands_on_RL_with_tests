@@ -5,3 +5,5 @@ Others/mappo_-mpe
 multiagent-particle-envs
 multiagent-particle-envs
 multiagent-particle-envs
+*.pth
+*.pkl
