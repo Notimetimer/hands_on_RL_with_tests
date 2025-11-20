@@ -30,16 +30,35 @@ def moving_average(a, window_size):
     return np.concatenate((begin, middle, end))
 
 
-def compute_advantage(gamma, lmbda, td_delta):
-    td_delta = td_delta.detach().numpy()
+# def compute_advantage(gamma, lmbda, td_delta):
+#     td_delta = td_delta.detach().numpy()
+#     advantage_list = []
+#     advantage = 0.0
+#     for delta in td_delta[::-1]:
+#         advantage = gamma * lmbda * advantage + delta
+#         advantage_list.append(advantage)
+#     advantage_list.reverse()
+#     return torch.tensor(np.array(advantage_list), dtype=torch.float)
+
+def compute_advantage(gamma, lmbda, td_delta, dones):
+    # 确保输入转为 numpy
+    td_delta = td_delta.detach().cpu().numpy()
+    dones = dones.detach().cpu().numpy()
+    
     advantage_list = []
     advantage = 0.0
-    for delta in td_delta[::-1]:
-        advantage = gamma * lmbda * advantage + delta
+    
+    # 反向遍历
+    # zip(td_delta[::-1], dones[::-1]) 同时获取当前的 delta 和 done
+    for delta, done in zip(td_delta[::-1], dones[::-1]):
+        # 如果当前步 done=1，则 mask=0，切断与上一时刻（时间上的未来）的联系
+        # GAE公式: A_t = delta_t + (gamma * lambda) * (1 - done_t) * A_{t+1}
+        mask = 1.0 - done 
+        advantage = delta + gamma * lmbda * advantage * mask
         advantage_list.append(advantage)
+    
     advantage_list.reverse()
     return torch.tensor(np.array(advantage_list), dtype=torch.float)
-
 
 class ValueNet(torch.nn.Module):
     def __init__(self, state_dim, hidden_dim):
@@ -226,7 +245,7 @@ class PPOContinuous:
         return a_exec[0].cpu().detach().numpy().flatten(), u[0].cpu().detach().numpy().flatten()
     
 
-    def update(self, transition_dict):
+    def update(self, transition_dict, advantage_norm=0, shuffled=0):
         """更新函数兼容以下几种调用方式：
         - 如果 action_bounds 是 None: 期望 transition_dict 中包含 'action_bounds'，其形状为 (N,2) 或每步 (amin,amax)
         - 如果 action_bounds 是标量/二元元组/数组：作为全局固定区间使用
@@ -242,10 +261,44 @@ class PPOContinuous:
         dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
         action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
 
-        # 计算 td_target, advantage
+        # # 计算 td_target, advantage
+        # td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
+        # td_delta = td_target - self.critic(states)
+        # advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
+
+        # td_target 计算部分保持不变，因为它已经处理了 (1-dones)
         td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
         td_delta = td_target - self.critic(states)
-        advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
+
+        # 【修改处】将 dones 传入 compute_advantage
+        # 注意：确保 td_delta 和 dones 都在 CPU 或 GPU 保持一致，
+        # 但函数内部我们已经处理了 .cpu().numpy()，所以直接传 tensor 即可
+        advantage = compute_advantage(self.gamma, self.lmbda, td_delta, dones).to(self.device)
+
+        # 可选1：对 advantage 做归一化（默认关闭）
+        if advantage_norm:
+            adv_mean = advantage.mean()
+            adv_std = advantage.std(unbiased=False)
+            advantage = (advantage - adv_mean) / (adv_std + 1e-8)
+
+        # 可选2：按 episode 打乱顺序（shuffle episodes, 保持每个 episode 内部顺序）
+        # shuffled=0/1 控制（默认 0）
+        if shuffled:
+            N = len(transition_dict['dones'])
+            if N > 1:
+                idx = torch.randperm(N, device=states.device)
+                # 统一按随机索引重排所有相关张量，保证对应关系不变
+                states = states[idx]
+                u_s = u_s[idx]
+                rewards = rewards[idx]
+                next_states = next_states[idx]
+                dones = dones[idx]
+                action_bounds = action_bounds[idx]
+                # 也把 td_target / td_delta / advantage 一并打乱
+                td_target = td_target[idx]
+                td_delta = td_delta[idx]
+                advantage = advantage[idx]
+            # N <= 1 时不做任何操作
 
         # 策略输出（未压缩的 mu,std）
         mu, std = self.actor(states)
