@@ -30,25 +30,48 @@ def moving_average(a, window_size):
     return np.concatenate((begin, middle, end))
 
 
-def compute_advantage(gamma, lmbda, td_delta, dones):
+# --- 保持 compute_advantage 函数，但根据传入参数数量切换逻辑 ---
+def compute_advantage(gamma, lmbda, td_delta, dones, truncateds=None): # truncateds 默认为 None
     # 确保输入转为 numpy
     td_delta = td_delta.detach().cpu().numpy()
-    dones = dones.detach().cpu().numpy()
+    dones = dones.detach().cpu().numpy() # 假设这里的 dones 是 terminateds (term)
+
+    if truncateds is None:
+        # --- 旧式/兼容模式：dones = term OR trunc ---
+        # 此时，dones 就是 $\text{done}_t$
+        advantage_list = []
+        advantage = 0.0
+        
+        for delta, done in zip(td_delta[::-1], dones[::-1]):
+            mask = 1.0 - done # $\text{Mask}_t = 1 - \text{done}_t$
+            advantage = delta + gamma * lmbda * advantage * mask
+            advantage_list.append(advantage)
+        
+        advantage_list.reverse()
+        return torch.tensor(np.array(advantage_list), dtype=torch.float)
     
-    advantage_list = []
-    advantage = 0.0
-    
-    # 反向遍历
-    # zip(td_delta[::-1], dones[::-1]) 同时获取当前的 delta 和 done
-    for delta, done in zip(td_delta[::-1], dones[::-1]):
-        # 如果当前步 done=1，则 mask=0，切断与上一时刻（时间上的未来）的联系
-        # GAE公式: A_t = delta_t + (gamma * lambda) * (1 - done_t) * A_{t+1}
-        mask = 1.0 - done 
-        advantage = delta + gamma * lmbda * advantage * mask
-        advantage_list.append(advantage)
-    
-    advantage_list.reverse()
-    return torch.tensor(np.array(advantage_list), dtype=torch.float)
+    else:
+        # --- 新式模式：需要 term (dones) 和 trunc (truncateds) ---
+        truncateds = truncateds.detach().cpu().numpy()
+        terminateds = dones # $\text{term}_t$
+        
+        advantage_list = []
+        advantage = 0.0
+        
+        for delta, term, trunc in zip(td_delta[::-1], terminateds[::-1], truncateds[::-1]):
+            # 1. GAE 传递项的修正因子: $\gamma \lambda (1 - \text{term}_t) A_{t+1}$
+            next_advantage_term = gamma * lmbda * advantage * (1.0 - term)
+            
+            # 2. 预估 A_t: $A'_t = \delta_t + \text{next\_advantage\_term}$
+            advantage = delta + next_advantage_term
+            
+            # 3. 最终 A_t 屏蔽: $A_t = (1 - \text{trunc}_t) \cdot A'_t$
+            advantage = advantage * (1.0 - trunc)
+            
+            advantage_list.append(advantage)
+        
+        advantage_list.reverse()
+        return torch.tensor(np.array(advantage_list), dtype=torch.float)
 
 class ValueNet(torch.nn.Module):
     def __init__(self, state_dim, hidden_dim):
@@ -191,18 +214,31 @@ class PPOContinuous:
         next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
         dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
         
-        # 计算 TD Target 和 Delta
-        # 注意：这里利用了 next_states。如果 buffer 的最后一步是截断（done=False），
-        # self.critic(next_states) 会自动提供 bootstrap value V(s_{t+1})，这是正确的处理方式。
+        use_new_gae = 'truncs' in transition_dict and len(transition_dict['truncs']) > 0
+
         with torch.no_grad():
             next_vals = self.critic(next_states)
             curr_vals = self.critic(states)
+
+        if use_new_gae:
+            # 新逻辑：区分 terminated (dones) 和 truncated (truncs)
+            terminateds = dones
+            truncateds = torch.tensor(np.array(transition_dict['truncs']), dtype=torch.float).view(-1, 1).to(self.device)
             
-        td_target = rewards + self.gamma * next_vals * (1 - dones)
-        td_delta = td_target - curr_vals
-        
-        # 计算 GAE
-        advantage = compute_advantage(self.gamma, self.lmbda, td_delta, dones).to(self.device)
+            # td_target 计算时，只有 terminated 才阻止 V(s_t+1) 的引导
+            td_target = rewards + self.gamma * next_vals * (1 - terminateds)
+            td_delta = td_target - curr_vals
+            
+            # GAE 计算需要同时传入 terminateds 和 truncateds
+            advantage = compute_advantage(self.gamma, self.lmbda, td_delta, terminateds, truncateds).to(self.device)
+        else:
+            # 旧逻辑：dones = terminated or truncated
+            # td_target 计算时，任何 done 都会阻止 V(s_t+1) 的引导
+            td_target = rewards + self.gamma * next_vals * (1 - dones)
+            td_delta = td_target - curr_vals
+            
+            # GAE 计算只传入 dones
+            advantage = compute_advantage(self.gamma, self.lmbda, td_delta, dones).to(self.device)
         
         # 将结果转回 list 并存入 dict，方便后续合并
         transition_dict['advantages'] = advantage.cpu().numpy().flatten().tolist()
@@ -216,20 +252,45 @@ class PPOContinuous:
         u_s = torch.tensor(np.array(transition_dict['actions']), dtype=torch.float).to(self.device)
         rewards = torch.tensor(np.array(transition_dict['rewards']), dtype=torch.float).view(-1, 1).to(self.device)
         next_states = torch.tensor(np.array(transition_dict['next_states']), dtype=torch.float).to(self.device)
+
         dones = torch.tensor(np.array(transition_dict['dones']), dtype=torch.float).view(-1, 1).to(self.device)
         action_bounds = torch.tensor(np.array(transition_dict['action_bounds']), dtype=torch.float).to(self.device)
 
-        # 【修改处】检查是否已经预计算了 advantage 和 target
-        if 'advantages' in transition_dict and 'td_targets' in transition_dict:
-            # 使用预计算的值（适用于并行环境已做好拼接）
-            advantage = torch.tensor(np.array(transition_dict['advantages']), dtype=torch.float).view(-1, 1).to(self.device)
-            td_target = torch.tensor(np.array(transition_dict['td_targets']), dtype=torch.float).view(-1, 1).to(self.device)
-        else:
-            # 兼容串行代码：现场计算 GAE
-            # 注意：如果 transition_dict 包含多个环境首尾相连的数据，这里算其实是有微小偏差的（边界处）
-            td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
-            td_delta = td_target - self.critic(states)
-            advantage = compute_advantage(self.gamma, self.lmbda, td_delta, dones).to(self.device)
+        # --- 检查是否需要新式 GAE 计算 ---
+        use_new_gae = 'truncs' in transition_dict and len(transition_dict['truncs']) > 0
+        
+        if use_new_gae: # 区分截断和终止
+            if 'advantages' in transition_dict and 'td_targets' in transition_dict:
+                # 使用预计算的值（适用于并行环境已做好拼接）
+                advantage = torch.tensor(np.array(transition_dict['advantages']), dtype=torch.float).view(-1, 1).to(self.device)
+                td_target = torch.tensor(np.array(transition_dict['td_targets']), dtype=torch.float).view(-1, 1).to(self.device)
+            else:
+                # 新式 GAE 流程：需要 $\text{term}$ ($\text{dones}$) 和 $\text{trunc}$ ($\text{truncs}$)
+                # 我们假设 transition_dict['dones'] 此时只包含 $\text{terminated}$ 信息
+                # 如果您的环境数据无法区分 $\text{term}$ 和 $\text{trunc}$，您需要手动解析数据。
+                # 为简化，我们暂时**假设** 'dones' 字段在新模式下就是 $\text{terminateds}$
+                terminateds = dones 
+                truncateds = torch.tensor(np.array(transition_dict['truncs']), dtype=torch.float).view(-1, 1).to(self.device)
+                
+                # 1. 计算 td_target (使用 terminateds 屏蔽 V(s_{t+1}))
+                td_target = rewards + self.gamma * self.critic(next_states) * (1 - terminateds)
+                td_delta = td_target - self.critic(states)
+                
+                # 2. 计算 advantage (传入 terminateds 和 truncateds)
+                advantage = compute_advantage(self.gamma, self.lmbda, td_delta, terminateds, truncateds).to(self.device)
+            
+        else:  # 合并截断和终止
+            if 'advantages' in transition_dict and 'td_targets' in transition_dict:
+                # 使用预计算的值（适用于并行环境已做好拼接）
+                advantage = torch.tensor(np.array(transition_dict['advantages']), dtype=torch.float).view(-1, 1).to(self.device)
+                td_target = torch.tensor(np.array(transition_dict['td_targets']), dtype=torch.float).view(-1, 1).to(self.device)
+            else:
+                # 旧式/兼容流程：使用 $\text{done} = \text{term} \lor \text{trunc}$ (即原有的 $\text{dones}$)
+                td_target = rewards + self.gamma * self.critic(next_states) * (1 - dones)
+                td_delta = td_target - self.critic(states)
+
+                # 使用原有的 compute_advantage 签名（只传入 dones 作为旧的 done）
+                advantage = compute_advantage(self.gamma, self.lmbda, td_delta, dones).to(self.device)
 
         # 可选1：对 advantage 做归一化（默认关闭）
         if advantage_norm:
