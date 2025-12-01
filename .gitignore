@@ -7,3 +7,4 @@ multiagent-particle-envs
 multiagent-particle-envs
 *.pth
 *.pkl
+*.pyc
