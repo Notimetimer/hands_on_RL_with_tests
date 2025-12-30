@@ -73,7 +73,7 @@ class Env:
         
         if self.done:
             if self.out_range:
-                reward1 -= 50 + 50*(20-self.steps)/20 # 5  50 # 100
+                reward1 -= 100 + 50*(20-self.steps)/20 # 5  50 # 100
 
         return reward1 # - 1
 
