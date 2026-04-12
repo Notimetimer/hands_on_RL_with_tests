@@ -109,7 +109,7 @@ class GATLayer(nn.Module):
 
         if adj_mask is not None:
             # adj_mask: (B, N) -> 转为 (B, 1, N) 进行广播屏蔽不存在的节点
-            mask = adj_mask.unsqueeze(1) 
+            mask = adj_mask.unsqueeze(1)
             e = e.masked_fill(mask == 0, -1e9)
 
         # 注意力权重: (B, N, N) - softmax后，每一行和为1
@@ -147,7 +147,8 @@ class GATActor(nn.Module):
         
         # 用于存储和追踪注意力权重的属性
         self.last_attn_weights = None  # (B, 1, 1) GAT 单节点自注意力权重
-
+    
+    # Actor forward
     def forward(self, obs, active_mask=None, agent_ids=None):
         """
         参数:

@@ -19,10 +19,10 @@ CRITIC_HIDDEN_DIMS_FRONT = [64]
 
 # 环境相关
 ENV_N = 2 # 3 个以上就学不会了?
-ENV_MAX_CYCLES = 100
+ENV_MAX_CYCLES = 50 # 3 个以上需要至少100步
 
 # 训练相关
-NUM_EPISODES = 1000 # 2000
+NUM_EPISODES = 2000 # 2000
 UPDATE_INTERVAL = 10
 BATCH_SIZE = 128
 
@@ -78,9 +78,10 @@ def _get_positions_from_env(env):
     # 其他回退方案可加在这里（基于 infos 等），当前返回 None
     return None, None
 
-class GATLayer(nn.Module):
+class GATLayerWithEdgeMask(nn.Module):
+    """改进的 GAT 层，支持边级掩码（边掩码优先级高于节点掩码）"""
     def __init__(self, in_features, out_features, dropout=0.0, alpha=0.2, concat=True):
-        super(GATLayer, self).__init__()
+        super(GATLayerWithEdgeMask, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
         self.alpha = alpha
@@ -91,30 +92,49 @@ class GATLayer(nn.Module):
         nn.init.xavier_uniform_(self.a.data, gain=1.414)
         self.leakyrelu = nn.LeakyReLU(self.alpha)
 
-    def forward(self, h, adj_mask=None, return_attention=False):
-        # h: (Batch, N_nodes, in_features)
+    def forward(self, h, adj_mask=None, edge_mask=None, return_attention=False):
+        """
+        参数:
+            h: (B, N, in_features) - 节点特征
+            adj_mask: (B, N) - 节点活跃度掩码
+            edge_mask: (B, N, N) - 边掩码矩阵，1=允许，0=禁止
+            return_attention: bool - 是否返回注意力权重
+        """
+        # h: 输入的节点特征矩阵 (Batch_Size, N_nodes, in_features)
         Wh = self.W(h) # (Batch, N_nodes, out_features)
         B, N, _ = Wh.size()
 
         # 构造注意力得分矩阵 (利用广播拼接所有节点对)
-        # Wh_i: (B, N, 1, out_f), Wh_j: (B, 1, N, out_f)
+        # Wh_i: 将 Wh 扩展并重复，作为“目标节点”（接收信息者）(B, N, N, out_f)
         Wh_i = Wh.unsqueeze(2).repeat(1, 1, N, 1)
+        # Wh_j: 将 Wh 扩展并重复，作为“源节点”（发送信息者）(B, N, N, out_f)
         Wh_j = Wh.unsqueeze(1).repeat(1, N, 1, 1)
         
-        # a_input: (B, N, N, 2*out_f)
+        # a_input: 节点对特征拼接 [Wh_i; Wh_j] (B, N, N, 2*out_f)
+        # 代表了任意两个节点 i 和 j 之间的“交互特征”
         a_input = torch.cat([Wh_i, Wh_j], dim=-1)
         
-        # e: (B, N, N)
+        # e: 原始注意力得分 (B, N, N)
+        # 通过将拼接后的特征与参数 self.a 相乘并送入 LeakyReLU 得到
+        # e[b, i, j] 表示在样本 b 中，节点 j 对节点 i 的重要程度
         e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(-1))
 
+        # 应用掩码 (Masking)
+        # 将被遮蔽（禁止连接）的位置设为 -1e9，这样在接下来的 softmax 中权重会变为 0
+        # 引用边掩码
+        if edge_mask is not None:
+            e = e.masked_fill(edge_mask == 0, -1e9)
+        # 应用节点掩码
         if adj_mask is not None:
             # adj_mask: (B, N) -> 转为 (B, 1, N) 进行广播屏蔽不存在的节点
-            mask = adj_mask.unsqueeze(1) 
+            mask = adj_mask.unsqueeze(1)
             e = e.masked_fill(mask == 0, -1e9)
 
         # 注意力权重: (B, N, N) - softmax后，每一行和为1
         attention = F.softmax(e, dim=-1)
-        # h_prime: (B, N, out_features)
+        # h_prime: 聚合后的新节点特征 (B, N, out_features)
+        # 矩阵乘法相当于：h_prime[i] = Σ (attention[i, j] * Wh[j])
+        # 每个节点根据注意力权重吸纳其“邻居”（包括自己）的信息
         h_prime = torch.matmul(attention, Wh)
 
         output = F.elu(h_prime) if self.concat else h_prime
@@ -123,7 +143,6 @@ class GATLayer(nn.Module):
             return output, attention
         else:
             return output
-
 
 class GATBlock(nn.Module):
     """GAT block with optional multi-head support, residual connection and LayerNorm.
@@ -188,7 +207,7 @@ class GATBlock(nn.Module):
             return out, attn
         return out
 
-class StructuredGATActor(nn.Module):
+class GATActor(nn.Module):
     """
     具备 2 层 GAT 结构的 Actor：
     - 能够理解：队友(Teammate) 与 地标(Landmark) 之间的关系
@@ -257,6 +276,7 @@ class StructuredGATActor(nn.Module):
         f_lms = obs[:, others_end:others_end + 2 * self.n_landmarks].view(B, self.n_landmarks, 2)
         return f_self, f_others, f_lms
 
+    # Actor forward
     def forward(self, obs, active_mask=None, agent_ids=None):
         B = obs.shape[0]
         device = obs.device
@@ -283,59 +303,8 @@ class StructuredGATActor(nn.Module):
         self_feat = h[:, 0, :]
         logits = self.output(self_feat)
         return logits
-    
 
-
-class GATLayerWithEdgeMask(nn.Module):
-    """改进的 GAT 层，支持边级掩码（边掩码优先级高于节点掩码）"""
-    def __init__(self, in_features, out_features, dropout=0.0, alpha=0.2, concat=True):
-        super(GATLayerWithEdgeMask, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.alpha = alpha
-        self.concat = concat
-
-        self.W = nn.Linear(in_features, out_features, bias=False)
-        self.a = nn.Parameter(torch.empty(size=(2 * out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
-
-    def forward(self, h, adj_mask=None, edge_mask=None, return_attention=False):
-        """
-        参数:
-            h: (B, N, in_features) - 节点特征
-            adj_mask: (B, N) - 节点活跃度掩码
-            edge_mask: (B, N, N) - 边掩码矩阵，1=允许，0=禁止
-            return_attention: bool - 是否返回注意力权重
-        """
-        Wh = self.W(h)
-        B, N, _ = Wh.size()
-
-        Wh_i = Wh.unsqueeze(2).repeat(1, 1, N, 1)
-        Wh_j = Wh.unsqueeze(1).repeat(1, N, 1, 1)
-        a_input = torch.cat([Wh_i, Wh_j], dim=-1)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(-1))
-
-        # 应用边掩码（高优先级）
-        if edge_mask is not None:
-            e = e.masked_fill(edge_mask == 0, -1e9)
-        
-        # 应用节点掩码
-        if adj_mask is not None:
-            mask = adj_mask.unsqueeze(1)
-            e = e.masked_fill(mask == 0, -1e9)
-
-        attention = F.softmax(e, dim=-1)
-        h_prime = torch.matmul(attention, Wh)
-        output = F.elu(h_prime) if self.concat else h_prime
-        
-        if return_attention:
-            return output, attention
-        else:
-            return output
-
-
-class StructuredGATCritic(nn.Module):
+class GATCritic(nn.Module):
     """
     改进的 Critic：显式建模 Agent-Landmark 图结构
     - 前 N 个节点：agents
@@ -407,10 +376,10 @@ class StructuredGATCritic(nn.Module):
     def forward(self, obs_matrix, active_mask=None):
         """
         参数:
-            obs_matrix: (B, N, obs_dim)
-            active_mask: (B, N)
+            obs_matrix: (B, N, Obs_Dim) - 所有 agents 的 observations
+            active_mask: (B, N) - 代理活跃度掩码
         返回:
-            values: (B, N) - agents 的价值
+            values: (B, N) - 每个 agent 的 value 估计
         """
         B, N, _ = obs_matrix.shape
         device = obs_matrix.device
@@ -491,15 +460,15 @@ class MAPPO:
         # actor: expects per-agent observation vector
         actor_hidden = actor_hidden_dims[0] if len(actor_hidden_dims) > 0 else 128
         critic_hidden = critic_hidden_dims_front[0] if len(critic_hidden_dims_front) > 0 else 64
-        self.actor = StructuredGATActor(
+        self.actor = GATActor(
             n_agents=num_agents,
             n_landmarks=num_agents,
             node_dim=obs_dim, 
             hidden_dim=actor_hidden, 
             action_dim=action_dim
         ).to(device)
-        # critic: expects (batch, N, obs_dim) - 使用改进的 StructuredGATCritic 支持边级掩码
-        self.critic = StructuredGATCritic(
+        # critic: expects (batch, N, obs_dim) - 使用改进的 GATCritic 支持边级掩码
+        self.critic = GATCritic(
             n_agents=num_agents,
             node_dim=obs_dim,
             n_landmarks=num_agents,  # Simple Spread V3 通常 landmarks = agents

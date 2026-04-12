@@ -18,8 +18,8 @@ CRITIC_HIDDEN_DIMS_BACK = [128, 128] # [128]
 CRITIC_HIDDEN_DIMS_FRONT = [64]
 
 # 环境相关
-ENV_N = 3 # 3 个以上就学不会了?
-ENV_MAX_CYCLES = 100
+ENV_N = 2 # 3 个以上就学不会了?
+ENV_MAX_CYCLES = 50 # 3 个以上需要至少100步
 
 # 训练相关
 NUM_EPISODES = 2000
