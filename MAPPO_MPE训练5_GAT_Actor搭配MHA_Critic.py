@@ -303,11 +303,6 @@ class StructuredGATActor(nn.Module):
             nn.Linear(hidden_dim, action_dim)
         )
         
-        # --- 修复 2：注入节点身份与类型标识 Embedding（解决注意力“脸盲”） ---
-        self.node_id_emb = nn.Embedding(self.total_nodes, hidden_dim)
-        nn.init.orthogonal_(self.node_id_emb.weight)
-        self.node_id_emb.weight.requires_grad = False 
-
     def _create_edge_mask(self, batch_size, device):
         """
         按照你的要求精确裁剪拓扑：
@@ -360,10 +355,6 @@ class StructuredGATActor(nn.Module):
         # 拼接为图节点矩阵 (B, 1+(N-1)+M, H)
         h = torch.cat([h_self, h_others, h_lms], dim=1)    # (B, Total_Nodes, H)
         
-        # --- 修复 2：给节点打上身份与类别标签 ---
-        pos_ids = torch.arange(self.total_nodes, device=device)
-        h = h + self.node_id_emb(pos_ids).unsqueeze(0)
-        
         # 2. 生成边掩码 (Landmark出发边为0)
         edge_mask = self._create_edge_mask(B, device)
         
@@ -381,138 +372,40 @@ class StructuredGATActor(nn.Module):
         logits = self.output(self_feat)
         return logits
 
-class StructuredGATCritic(nn.Module):
-    """
-    改进的 Critic：显式建模 Agent-Landmark 图结构
-    - 前 N 个节点：agents
-    - 后 M 个节点：landmarks
-    
-    掩码策略：
-    - Agent → Agent：✓ 允许
-    - Agent → Landmark：✓ 允许  
-    - Landmark → Any：✗ 禁止（landmarks 被动）
-    """
-    def __init__(self, n_agents, node_dim, n_landmarks, hidden_dim=64):
+class UnifiedAttentionValueNet(nn.Module):
+    def __init__(self, n_agents, node_dim, hidden_dim):
         super().__init__()
-        self.n_agents = n_agents
-        self.n_landmarks = n_landmarks
-        self.total_nodes = n_agents + n_landmarks
-        self.node_dim = node_dim
-        self.hidden_dim = hidden_dim
+        self.n = n_agents
+        self.feature_encoder = nn.Linear(node_dim, hidden_dim)
         
-        self.agent_encoder = nn.Linear(node_dim, hidden_dim)
-        self.landmark_encoder = nn.Linear(2, hidden_dim)
+        # 统一自注意力层
+        self.attn = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=2, batch_first=True)
         
-        # use GATBlock (pre-norm residual + optional multi-head). n_heads=1 keeps structure minimal.
-        # 单层
-        self.gat1 = GATBlock(hidden_dim, hidden_dim, n_heads=1, dropout=0.0, alpha=0.2, concat=False)
-        # # 两层
-        # self.gat1 = GATBlock(hidden_dim, hidden_dim, n_heads=1, dropout=0.0)
-        # self.gat2 = GATBlock(hidden_dim, hidden_dim, n_heads=1, dropout=0.0, concat=False)
-        
+        # 状态价值输出
         self.v_head = nn.Linear(hidden_dim, 1)
-
-        # --- 修复 2：注入节点身份与类型标识 Embedding（解决注意力“脸盲”） ---
-        self.node_id_emb = nn.Embedding(self.total_nodes, hidden_dim)
-        nn.init.orthogonal_(self.node_id_emb.weight)
-        self.node_id_emb.weight.requires_grad = False
-
-    def _extract_landmark_features(self, obs_matrix):
-        """
-        从观察向量中提取 landmark 相对位置特征
-        
-        Simple Spread V3 观察布局：
-        [0:2] - 自己位置, [2:4] - 自己速度
-        [4:4+2*(N-1)] - 其他 agents 相对位置
-        [4+2*(N-1):] - landmarks 相对位置
-        """
-        batch_size = obs_matrix.shape[0]
-        landmark_offset = 4 + 2 * (self.n_agents - 1)
-        
-        if obs_matrix.shape[2] > landmark_offset:
-            landmark_end = landmark_offset + 2 * self.n_landmarks
-            # --- 修复 1：计算地标的真实绝对特征，消除 0号智能体视角的错位 ---
-            # 0号智能体的绝对坐标 (B, 2)
-            agent0_pos = obs_matrix[:, 0, 0:2]
-            # 0号智能体看地标的相对极坐标 (B, M, 2)
-            rel_landmark_feats = obs_matrix[:, 0, landmark_offset:landmark_end]
-            rel_landmark_feats = rel_landmark_feats.view(batch_size, self.n_landmarks, 2)
-            # 全场统一的绝对坐标 = 自身绝对坐标 + 相对偏移
-            abs_landmark_feats = rel_landmark_feats + agent0_pos.unsqueeze(1)
-            return abs_landmark_feats
-        else:
-            return torch.zeros(batch_size, self.n_landmarks, 2, device=obs_matrix.device)
-
-    def _create_edge_mask(self, batch_size, device):
-        """
-        Critic 全局掩码：
-        - 节点 0 ~ N-1: 所有的 Agents
-        - 节点 N ~ End: 所有的 Landmarks
-        """
-        # 初始全 0
-        mask = torch.zeros(batch_size, self.total_nodes, self.total_nodes, device=device)
-        
-        # 规则 1: 所有 Agents (0 ~ n_agents-1) 作为 Target 时，可以看所有人
-        # (这样 Agent 之间能互看，Agent 也能看地标)
-        mask[:, :self.n_agents, :] = 1
-        
-        # 规则 2: 所有 Landmarks (n_agents ~ End) 作为 Target 时，不准看任何人
-        # (这符合地标是被动观测物的逻辑，这一行保持为 0 即可)
-        
-        # 规则 3: 允许自环
-        for i in range(self.total_nodes):
-            mask[:, i, i] = 1
-            
-        return mask
 
     def forward(self, obs_matrix, active_mask=None):
         """
-        参数:
-            obs_matrix: (B, N, obs_dim)
-            active_mask: (B, N)
-        返回:
-            values: (B, N) - agents 的价值
+        obs_matrix: (Batch, N, Obs_Dim) 这里是每个 Agent 的全观测
+        active_mask: (Batch, N) 哪些 Agent 活着
         """
-        B, N, _ = obs_matrix.shape
-        device = obs_matrix.device
+        batch_size = obs_matrix.shape[0]
         
-        # 编码 agents
-        agent_features = F.relu(self.agent_encoder(obs_matrix))  # (B, N, H)
+        # 1. 编码
+        h = F.relu(self.feature_encoder(obs_matrix)) # (B, N, H)
         
-        # 编码 landmarks
-        landmark_features_raw = self._extract_landmark_features(obs_matrix)
-        landmark_features = F.relu(self.landmark_encoder(landmark_features_raw))  # (B, M, H)
-        
-        # 拼接构建完整图
-        h = torch.cat([agent_features, landmark_features], dim=1)  # (B, N+M, H)
-        
-        # --- 修复 2：给图节点打上坚固的身份刻印 ---
-        pos_ids = torch.arange(self.total_nodes, device=device)
-        h = h + self.node_id_emb(pos_ids).unsqueeze(0)
-        
-        # 扩展 active mask
+        # 2. 这里的 Padding Mask 决定了死掉的 Agent 不会被关注到
+        p_mask = None
         if active_mask is not None:
-            landmarks_active = torch.ones(B, self.n_landmarks, device=device)
-            full_active_mask = torch.cat([active_mask, landmarks_active], dim=1)
-        else:
-            full_active_mask = None
+            p_mask = ~(active_mask.bool()) # (B, N) 1为活，0为死，取反给 Attention
+            
+        # 3. 全局自注意力（所有活着的智能体互相观察）
+        attn_out, _ = self.attn(h, h, h, key_padding_mask=p_mask)
+        h = h + attn_out
         
-        # 创建边掩码
-        edge_mask = self._create_edge_mask(B, device)
-        
-        # 应用 GAT
-        # 单层
-        h = self.gat1(h, adj_mask=full_active_mask, edge_mask=edge_mask)
-
-        # # 两层
-        # h = self.gat1(h, adj_mask=full_active_mask, edge_mask=edge_mask)
-        # h = self.gat2(h, adj_mask=full_active_mask, edge_mask=edge_mask)
-        
-        # 输出价值
-        all_values = self.v_head(h).squeeze(-1)  # (B, N+M)
-        agent_values = all_values[:, :N]  # (B, N)
-        
-        return agent_values
+        # 4. 输出每个智能体的 Value
+        values = self.v_head(h).squeeze(-1) # (B, N)
+        return values
 
 class RolloutBuffer:
     """专为 MARL 设计的顺序轨迹缓冲区，方便进行 GAE 计算"""
@@ -568,12 +461,7 @@ class MAPPO:
             action_dim=action_dim
         ).to(device)
         # critic: expects (batch, N, obs_dim) - 使用改进的 StructuredGATCritic 支持边级掩码
-        self.critic = StructuredGATCritic(
-            n_agents=num_agents,
-            node_dim=obs_dim,
-            n_landmarks=num_agents,  # Simple Spread V3 通常 landmarks = agents
-            hidden_dim=critic_hidden
-        ).to(device)
+        self.critic = UnifiedAttentionValueNet(num_agents, node_dim=obs_dim, hidden_dim=critic_hidden).to(device)
         
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)

@@ -18,11 +18,11 @@ CRITIC_HIDDEN_DIMS_BACK = [128, 128] # [128]
 CRITIC_HIDDEN_DIMS_FRONT = [64]
 
 # 环境相关
-ENV_N = 3 # 3 个以上就学不会了?
-ENV_MAX_CYCLES = 100
+ENV_N = 2 # 3 个以上就学不会了?
+ENV_MAX_CYCLES = 50 # 3 个以上需要至少100步
 
 # 训练相关
-NUM_EPISODES = 1000 # 2000
+NUM_EPISODES = 2000
 UPDATE_INTERVAL = 10
 BATCH_SIZE = 128
 
@@ -78,137 +78,435 @@ def _get_positions_from_env(env):
     # 其他回退方案可加在这里（基于 infos 等），当前返回 None
     return None, None
 
-class GATLayer(nn.Module):
+class ParallelAttentionActor(nn.Module):
+    def __init__(self, n_agents, node_dim, hidden_dim, action_dim):
+        super().__init__()
+        self.n = n_agents
+        self.hidden_dim = hidden_dim
+        
+        # 1. 特征编码：将不同含义的物理维度映射到统一空间
+        self.proj_self = nn.Linear(4, hidden_dim)      # 自身: [vx, vy, x, y]
+        self.proj_lm = nn.Linear(2, hidden_dim)        # 地标: [rel_x, rel_y]
+        self.proj_other = nn.Linear(2, hidden_dim)     # 队友: [rel_x, rel_y]
+        
+        # 给每个地标一个唯一的身份 ID
+        self.lm_id_emb = nn.Embedding(n_agents, hidden_dim)
+        nn.init.orthogonal_(self.lm_id_emb.weight)
+        # 冻结参数，使其不再作为“噪声源”干扰训练
+        self.lm_id_emb.weight.requires_grad = False 
+        
+        # 给智能体“我”id
+        self.agent_id_emb = nn.Embedding(n_agents, hidden_dim)
+        nn.init.orthogonal_(self.agent_id_emb.weight)
+        # 冻结参数，使其不再作为“噪声源”干扰训练
+        self.agent_id_emb.weight.requires_grad = False 
+        
+        # 2. 并联 Cross-Attention 模块
+        # 我观察地标
+        self.attn_lm = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=2, batch_first=True)
+        # 我观察队友
+        self.attn_other = nn.MultiheadAttention(embed_dim=hidden_dim, num_heads=2, batch_first=True)
+        
+        # 3. 最终融合决策层
+        # 输入是 [Self_feat, Attn_LM_feat, Attn_Other_feat] 的拼接
+        self.fusion = nn.Sequential(
+            nn.Linear(hidden_dim * 3, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        # 必须对所有线性层和注意力投影层做正交初始化
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.orthogonal_(m.weight, gain=np.sqrt(2))
+                nn.init.constant_(m.bias, 0)
+        # 动作输出层 gain 设小一点，增加初始探索
+        nn.init.orthogonal_(self.fusion[-1].weight, gain=0.01)
+
+    def forward(self, obs, active_mask=None, agent_ids=None):
+        """
+        obs: (Batch, obs_dim)
+        active_mask: (Batch, n_agents) 标记哪些队友是活着的
+        """
+        batch_size = obs.shape[0]
+        device = obs.device
+        
+        # --- 步骤 1: 动态切分 (由 N 驱动) ---
+        idx_lm_end = 4 + 2 * self.n
+        idx_other_end = idx_lm_end + 2 * (self.n - 1)
+        
+        feat_self = obs[:, 0:4].unsqueeze(1) # (B, 1, 4)
+        feat_lm = obs[:, 4:idx_lm_end].view(batch_size, self.n, 2) # (B, N, 2)
+        feat_other = obs[:, idx_lm_end:idx_other_end].view(batch_size, self.n - 1, 2) # (B, N-1, 2)
+        
+        # --- 步骤 2: 投影 ---
+        q = self.proj_self(feat_self)         # (B, 1, H)
+        k_lm = self.proj_lm(feat_lm)          # (B, N, H)
+        k_other = self.proj_other(feat_other) # (B, N-1, H)
+        
+        # 注入智能体 ID embedding（若提供）
+        if agent_ids is not None:
+            agent_id_tensor = agent_ids.view(-1).to(device)
+            my_id_feat = self.agent_id_emb(agent_id_tensor) # (B, H)
+        else:
+            my_id_feat = torch.zeros(batch_size, self.hidden_dim, device=device)
+        q = q + my_id_feat.unsqueeze(1) # 注入身份偏置
+        
+        # 投影地标特征        
+        # 【关键步骤】：给地标加上身份标签
+        # 生成 [0, 1, 2, ..., N-1] 的 ID
+        device = obs.device
+        lm_ids = torch.arange(self.n, device=device) # (N,)
+        ids_emb = self.lm_id_emb(lm_ids) # (N, H)
+        # 将 ID 嵌入加到地标特征上
+        k_lm = k_lm + ids_emb.unsqueeze(0) # 利用广播机制加到整个 Batch 上
+
+        # --- 步骤 3: 并联注意力计算 ---
+        # 3.1 地标支路 (通常地标永远存在，不设 Mask)
+        # 返回 attention weights 以供可视化/调试
+        context_lm, attn_weights_lm = self.attn_lm(q, k_lm, k_lm, average_attn_weights=False)
+        # 保存到模块属性，方便外部读取（detach 到 CPU 避免占用 grad/GPU 内存）
+        try:
+            self.last_attn_lm_weights = attn_weights_lm.detach().cpu()
+        except Exception:
+            self.last_attn_lm_weights = None
+        
+        # 3.2 队友支路 (使用 Mask 处理死亡或不可见的队友)
+        # 注意：PyTorch 的 key_padding_mask 中 True 表示屏蔽
+        # 假设传入的 active_mask 是 [1, 1, 0]，我们需要把它变成队友部分的 Mask
+        if active_mask is not None and self.n > 1:
+            # 这里的逻辑需要根据你 buffer 存的顺序微调，假设 mask 对应 [Self, Other1, Other2...]
+            # 我们只需要 Other 部分的 Mask
+            other_mask = ~(active_mask[:, 1:].bool()) # (B, N-1)
+            context_other, attn_weights_other = self.attn_other(q, k_other, k_other, key_padding_mask=other_mask, average_attn_weights=False)
+        else:
+            if self.n > 1:
+                context_other, attn_weights_other = self.attn_other(q, k_other, k_other, average_attn_weights=False)
+            else:
+                context_other = torch.zeros_like(q) # N=1 时没队友
+                attn_weights_other = None
+
+        # 保存队友注意力权重到模块属性，方便外部读取
+        try:
+            self.last_attn_other_weights = attn_weights_other.detach().cpu() if attn_weights_other is not None else None
+        except Exception:
+            self.last_attn_other_weights = None
+
+        # --- 步骤 4: 拼接融合 ---
+        combined = torch.cat([q, context_lm, context_other], dim=-1).squeeze(1) # (B, 3*H)
+        logits = self.fusion(combined)
+        return logits
+
+class OfficialMHALayerWithMask(nn.Module):
+    """
+    使用 PyTorch 官方 nn.MultiheadAttention 实现的完美平替版本。
+    速度更快，底层自动优化，支持多头。
+    """
+    def __init__(self, in_features, out_features, n_heads=1, dropout=0.0):
+        super().__init__()
+        
+        # 保证输入维度与 MHA 期望的特征维度一致
+        self.in_proj = nn.Linear(in_features, out_features) if in_features != out_features else nn.Identity()
+        
+        # 官方 MHA (设置 batch_first=True 让输入形状保持为 [B, N, E])
+        self.mha = nn.MultiheadAttention(
+            embed_dim=out_features, 
+            num_heads=n_heads, 
+            dropout=dropout, 
+            batch_first=True
+        )
+
+    def forward(self, h, adj_mask=None, edge_mask=None, return_attention=False):
+        """
+        h: (B, N, in_features)
+        adj_mask: (B, N) -> 1为存活，0为死亡/Padding
+        edge_mask: (B, N, N) -> 1为允许看，0为禁止看
+        """
+        h_proj = self.in_proj(h)
+        
+        # 1. 转换 Padding 掩码 (给 key_padding_mask 使用)
+        # PyTorch 规则: True 代表被忽略 (所以我们要对 1/0 逻辑取反)
+        key_padding_mask = None
+        if adj_mask is not None:
+            key_padding_mask = ~(adj_mask.bool())  # (B, N)
+
+        # 2. 转换结构/拓扑掩码 (给 attn_mask 使用)
+        # PyTorch 规则: True / -inf 代表不允许看。形状必须是 (B * n_heads, N, N)
+        attn_mask = None
+        if edge_mask is not None:
+            bool_edge_mask = ~(edge_mask.bool())  # (B, N, N)，反转逻辑
+            n_heads = self.mha.num_heads
+            # 按 Batch 维度复制 n_heads 次，以符合官方 API 强制要求
+            attn_mask = bool_edge_mask.repeat_interleave(n_heads, dim=0)
+
+        # 3. 前向传播
+        # need_weights=return_attention, average_attn_weights=True 保证多头融合后的权重兼容旧代码
+        attn_output, attn_weights = self.mha(
+            query=h_proj, 
+            key=h_proj, 
+            value=h_proj,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            need_weights=return_attention,
+            average_attn_weights=True 
+        )
+
+        if return_attention:
+            return attn_output, attn_weights
+        else:
+            return attn_output
+
+# 上面那个的手写版本
+class QKVLayerWithEdgeMask(nn.Module):
+    """
+    轻量级 QKV 缩放点积注意力层，作为原 GATLayerWithEdgeMask 的完美平替。
+    """
     def __init__(self, in_features, out_features, dropout=0.0, alpha=0.2, concat=True):
-        super(GATLayer, self).__init__()
+        super(QKVLayerWithEdgeMask, self).__init__()
         self.in_features = in_features
         self.out_features = out_features
-        self.alpha = alpha
         self.concat = concat
 
-        self.W = nn.Linear(in_features, out_features, bias=False)
-        self.a = nn.Parameter(torch.empty(size=(2 * out_features, 1)))
-        nn.init.xavier_uniform_(self.a.data, gain=1.414)
-        self.leakyrelu = nn.LeakyReLU(self.alpha)
-
-    def forward(self, h, adj_mask=None, return_attention=False):
-        # h: (Batch, N_nodes, in_features)
-        Wh = self.W(h) # (Batch, N_nodes, out_features)
-        B, N, _ = Wh.size()
-
-        # 构造注意力得分矩阵 (利用广播拼接所有节点对)
-        # Wh_i: (B, N, 1, out_f), Wh_j: (B, 1, N, out_f)
-        Wh_i = Wh.unsqueeze(2).repeat(1, 1, N, 1)
-        Wh_j = Wh.unsqueeze(1).repeat(1, N, 1, 1)
+        # 分离的 Q, K, V 线性映射 (不再共享同一个 W)
+        self.W_q = nn.Linear(in_features, out_features, bias=False)
+        self.W_k = nn.Linear(in_features, out_features, bias=False)
+        self.W_v = nn.Linear(in_features, out_features, bias=False)
         
-        # a_input: (B, N, N, 2*out_f)
-        a_input = torch.cat([Wh_i, Wh_j], dim=-1)
+        # 缩放因子 (1 / sqrt(d_k))
+        self.scale = math.sqrt(out_features)
         
-        # e: (B, N, N)
-        e = self.leakyrelu(torch.matmul(a_input, self.a).squeeze(-1))
+        # 兼容原版的激活逻辑 (多头拼接时使用 ELU，最后一层取特征时不激活)
+        self.activation = F.elu if self.concat else nn.Identity()
 
+    def forward(self, h, adj_mask=None, edge_mask=None, return_attention=False):
+        """
+        参数:
+            h: (B, N, in_features) - 节点特征
+            adj_mask: (B, N) - 节点活跃度掩码 (1=存活/真实, 0=死亡/Padding)
+            edge_mask: (B, N, N) - 拓扑边掩码 (1=允许看, 0=禁止看)
+        """
+        # 1. 计算 Q, K, V
+        Q = self.W_q(h)  # (B, N, out_features)
+        K = self.W_k(h)  # (B, N, out_features)
+        V = self.W_v(h)  # (B, N, out_features)
+        
+        # 2. 缩放点积打分 (B, N, N)
+        # Q: (B, N, out), K^T: (B, out, N)
+        scores = torch.matmul(Q, K.transpose(-2, -1)) / self.scale
+        
+        # 3. 构建联合掩码 (合并结构掩码与 Padding 掩码)
+        B, N, _ = h.shape
+        valid_mask = torch.ones(B, N, N, dtype=torch.bool, device=h.device)
+        
+        # 应用边掩码 (结构化约束)
+        if edge_mask is not None:
+            valid_mask = valid_mask & edge_mask.bool()
+            
+        # 应用节点掩码 (Padding约束)
         if adj_mask is not None:
-            # adj_mask: (B, N) -> 转为 (B, 1, N) 进行广播屏蔽不存在的节点
-            mask = adj_mask.unsqueeze(1)
-            e = e.masked_fill(mask == 0, -1e9)
+            # 屏蔽掉作为 Target (Query) 的无效节点
+            valid_mask = valid_mask & adj_mask.unsqueeze(2).bool()
+            # 屏蔽掉作为 Source (Key/Value) 的无效节点
+            valid_mask = valid_mask & adj_mask.unsqueeze(1).bool()
 
-        # 注意力权重: (B, N, N) - softmax后，每一行和为1
-        attention = F.softmax(e, dim=-1)
-        # h_prime: (B, N, out_features)
-        h_prime = torch.matmul(attention, Wh)
-
-        output = F.elu(h_prime) if self.concat else h_prime
+        # 4. 掩码阻断：将不允许关注的地方设为 -1e9 (Softmax后趋于0)
+        scores = scores.masked_fill(~valid_mask, -1e9)
+        
+        # 5. 注意力权重及特征聚合
+        attention = F.softmax(scores, dim=-1)
+        h_prime = torch.matmul(attention, V)
+        
+        output = self.activation(h_prime)
         
         if return_attention:
             return output, attention
         else:
             return output
 
-class GATActor(nn.Module):
-    """基于 GAT 的 Actor 网络：处理 per-agent 观察，支持注意力权重追踪"""
-    def __init__(self, n_agents, node_dim, hidden_dim, action_dim):
-        super().__init__()
-        self.n = n_agents
-        self.hidden_dim = hidden_dim
-        self.node_dim = node_dim
-        
-        # 特征编码器：将 raw observation 映射到 hidden_dim
-        self.feature_encoder = nn.Linear(node_dim, hidden_dim)
-        
-        # GAT 层：用于特征增强
-        self.gat = GATLayer(hidden_dim, hidden_dim, concat=True)
-        
-        # 输出层：生成 action logits
-        self.output = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_dim)
-        )
-        
-        # 用于存储和追踪注意力权重的属性
-        self.last_attn_weights = None  # (B, 1, 1) GAT 单节点自注意力权重
-    
-    # Actor forward
-    def forward(self, obs, active_mask=None, agent_ids=None):
-        """
-        参数:
-            obs: (Batch, obs_dim) - per-agent observation
-            active_mask: (Batch, n_agents) - 代理活跃度掩码（为了 API 兼容性，不直接使用）
-            agent_ids: (Batch,) - 代理 ID（为了 API 兼容性，不直接使用）
-        返回:
-            logits: (Batch, action_dim) - action logits
-        """
-        batch_size = obs.shape[0]
-        
-        # 特征编码: (B, obs_dim) -> (B, hidden_dim)
-        h = self.feature_encoder(obs)  # (B, hidden_dim)
-        
-        # 扩展为单节点图进行自注意力: (B, hidden_dim) -> (B, 1, hidden_dim)
-        h_graph = h.unsqueeze(1)  # (B, 1, hidden_dim)
-        h_graph, attn_weights = self.gat(h_graph, adj_mask=None, return_attention=True)
-        
-        # 存储注意力权重供外部使用（用于可视化/调试）
-        # attn_weights: (B, 1, 1) - 单节点自注意力，实际上总是[1]
-        self.last_attn_weights = attn_weights.detach().cpu() if isinstance(attn_weights, torch.Tensor) else None
-        
-        # 提取节点特征并生成 action logits
-        self_feat = h_graph[:, 0, :]  # (B, hidden_dim)
-        logits = self.output(self_feat)  # (B, action_dim)
-        return logits
 
-class GATCritic(nn.Module):
-    """基于 GAT 的 Critic 网络：处理全局状态产生每个 agent 的 value"""
-    def __init__(self, n_agents, node_dim, hidden_dim):
+class GATBlock(nn.Module):
+    """GAT block with optional multi-head support, residual connection and LayerNorm.
+    Uses one or multiple internal OfficialMHALayerWithMask instances (heads).
+    """
+    def __init__(self, in_dim, out_dim, n_heads=1, dropout=0.0, alpha=0.2, concat=True):
         super().__init__()
-        self.n = n_agents
-        # 特征编码器：将每个 agent 的 observation 映射到 hidden_dim
-        self.feature_encoder = nn.Linear(node_dim, hidden_dim)
+        self.in_dim = in_dim
+        self.out_dim = out_dim
+        self.n_heads = n_heads
+        self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity() # 随机失活率，用于防止过拟合，强化学习建议关闭
+        self.ln = nn.LayerNorm(in_dim) # 层归一化，用于防止过拟合
+        # alpha 是leakyrelu的负半轴斜率
+
+        # If multiple heads, split out_dim across heads (evenly)
+        if n_heads == 1:
+            self.heads = nn.ModuleList([OfficialMHALayerWithMask(in_dim, out_dim, dropout=0.0)])
+            self.merge_linear = None
+        else:
+            head_dim = out_dim // n_heads
+            self.heads = nn.ModuleList([OfficialMHALayerWithMask(in_dim, head_dim, dropout=0.0) for _ in range(n_heads)])
+            # linear to combine concatenated heads into out_dim
+            self.merge_linear = nn.Linear(head_dim * n_heads, out_dim)
+
+        # projection for residual when dims mismatch
+        if in_dim != out_dim:
+            self.res_proj = nn.Linear(in_dim, out_dim)
+        else:
+            self.res_proj = None
+
+    def forward(self, h, adj_mask=None, edge_mask=None, return_attention=False):
+        # pre-norm
+        h_norm = self.ln(h)
+
+        attns = []
+        outs = []
+        for head in self.heads:
+            out = head(h_norm, adj_mask=adj_mask, edge_mask=edge_mask, return_attention=return_attention)
+            if return_attention:
+                out_feat, attn = out
+                outs.append(out_feat)
+                attns.append(attn)
+            else:
+                outs.append(out)
+
+        if self.n_heads == 1:
+            out = outs[0]
+        else:
+            # concat along feature dim
+            out = torch.cat(outs, dim=-1)
+            if self.merge_linear is not None:
+                out = self.merge_linear(out)
+
+        out = self.dropout(out)
+
+        # residual
+        res = self.res_proj(h) if self.res_proj is not None else h
+        out = out + res
+
+        if return_attention:
+            # average attention across heads
+            attn = torch.stack(attns, dim=0).mean(dim=0)
+            return out, attn
+        return out
+
+class StructuredGATCritic(nn.Module):
+    """
+    改进的 Critic：显式建模 Agent-Landmark 图结构
+    - 前 N 个节点：agents
+    - 后 M 个节点：landmarks
+    
+    掩码策略：
+    - Agent → Agent：✓ 允许
+    - Agent → Landmark：✓ 允许  
+    - Landmark → Any：✗ 禁止（landmarks 被动）
+    """
+    def __init__(self, n_agents, node_dim, n_landmarks, hidden_dim=64):
+        super().__init__()
+        self.n_agents = n_agents
+        self.n_landmarks = n_landmarks
+        self.total_nodes = n_agents + n_landmarks
+        self.node_dim = node_dim
+        self.hidden_dim = hidden_dim
         
-        # 两层 GAT 进行特征融合和推理
-        self.gat1 = GATLayer(hidden_dim, hidden_dim)
-        self.gat2 = GATLayer(hidden_dim, hidden_dim, concat=False)
+        self.agent_encoder = nn.Linear(node_dim, hidden_dim)
+        self.landmark_encoder = nn.Linear(2, hidden_dim)
         
-        # 价值头：为每个 agent 生成标量 value
+        # use GATBlock (pre-norm residual + optional multi-head). n_heads=1 keeps structure minimal.
+        # 单层
+        self.gat1 = GATBlock(hidden_dim, hidden_dim, n_heads=1, dropout=0.0, alpha=0.2, concat=False)
+        # # 两层
+        # self.gat1 = GATBlock(hidden_dim, hidden_dim, n_heads=1, dropout=0.0)
+        # self.gat2 = GATBlock(hidden_dim, hidden_dim, n_heads=1, dropout=0.0, concat=False)
+        
         self.v_head = nn.Linear(hidden_dim, 1)
+
+    def _extract_landmark_features(self, obs_matrix):
+        """
+        从观察向量中提取 landmark 相对位置特征
+        
+        Simple Spread V3 观察布局：
+        [0:2] - 自己位置, [2:4] - 自己速度
+        [4:4+2*(N-1)] - 其他 agents 相对位置
+        [4+2*(N-1):] - landmarks 相对位置
+        """
+        batch_size = obs_matrix.shape[0]
+        landmark_offset = 4 + 2 * (self.n_agents - 1)
+        
+        if obs_matrix.shape[2] > landmark_offset:
+            landmark_end = landmark_offset + 2 * self.n_landmarks
+            landmark_features = obs_matrix[:, 0, landmark_offset:landmark_end]
+            return landmark_features.view(batch_size, self.n_landmarks, 2)
+        else:
+            return torch.zeros(batch_size, self.n_landmarks, 2, device=obs_matrix.device)
+
+    def _create_edge_mask(self, batch_size, device):
+        """
+        Critic 全局掩码：
+        - 节点 0 ~ N-1: 所有的 Agents
+        - 节点 N ~ End: 所有的 Landmarks
+        """
+        # 初始全 0
+        mask = torch.zeros(batch_size, self.total_nodes, self.total_nodes, device=device)
+        
+        # 规则 1: 所有 Agents (0 ~ n_agents-1) 作为 Target 时，可以看所有人
+        # (这样 Agent 之间能互看，Agent 也能看地标)
+        mask[:, :self.n_agents, :] = 1
+        
+        # 规则 2: 所有 Landmarks (n_agents ~ End) 作为 Target 时，不准看任何人
+        # (这符合地标是被动观测物的逻辑，这一行保持为 0 即可)
+        
+        # 规则 3: 允许自环
+        for i in range(self.total_nodes):
+            mask[:, i, i] = 1
+            
+        return mask
 
     def forward(self, obs_matrix, active_mask=None):
         """
         参数:
-            obs_matrix: (B, N, Obs_Dim) - 所有 agents 的 observations
-            active_mask: (B, N) - 代理活跃度掩码
+            obs_matrix: (B, N, obs_dim)
+            active_mask: (B, N)
         返回:
-            values: (B, N) - 每个 agent 的 value 估计
+            values: (B, N) - agents 的价值
         """
-        # obs_matrix: (B, N, Obs_Dim)
-        h = F.relu(self.feature_encoder(obs_matrix)) # (B, N, H)
+        B, N, _ = obs_matrix.shape
+        device = obs_matrix.device
         
-        # 图计算：所有智能体作为节点互相连接
-        h = self.gat1(h, adj_mask=active_mask)
-        h = self.gat2(h, adj_mask=active_mask)
+        # 编码 agents
+        agent_features = F.relu(self.agent_encoder(obs_matrix))  # (B, N, H)
         
-        # 输出每个节点的 Value
-        values = self.v_head(h).squeeze(-1) # (B, N)
-        return values
+        # 编码 landmarks
+        landmark_features_raw = self._extract_landmark_features(obs_matrix)
+        landmark_features = F.relu(self.landmark_encoder(landmark_features_raw))  # (B, M, H)
+        
+        # 拼接构建完整图
+        h = torch.cat([agent_features, landmark_features], dim=1)  # (B, N+M, H)
+        
+        # 扩展 active mask
+        if active_mask is not None:
+            landmarks_active = torch.ones(B, self.n_landmarks, device=device)
+            full_active_mask = torch.cat([active_mask, landmarks_active], dim=1)
+        else:
+            full_active_mask = None
+        
+        # 创建边掩码
+        edge_mask = self._create_edge_mask(B, device)
+        
+        # 应用 GAT
+        # 单层
+        h = self.gat1(h, adj_mask=full_active_mask, edge_mask=edge_mask)
+
+        # # 两层
+        # h = self.gat1(h, adj_mask=full_active_mask, edge_mask=edge_mask)
+        # h = self.gat2(h, adj_mask=full_active_mask, edge_mask=edge_mask)
+        
+        # 输出价值
+        all_values = self.v_head(h).squeeze(-1)  # (B, N+M)
+        agent_values = all_values[:, :N]  # (B, N)
+        
+        return agent_values
+
+# ================================================================= #
+#                      MAPPO 主算法与 Buffer                        #
+# ================================================================= #
 
 class RolloutBuffer:
     """专为 MARL 设计的顺序轨迹缓冲区，方便进行 GAE 计算"""
@@ -252,13 +550,13 @@ class MAPPO:
         self.eps = eps
         self.k_entropy = k_entropy
         
-        # Use the new GAT-based actor and critic
+        # Use the new attention-based actor and critic
         # actor: expects per-agent observation vector
         actor_hidden = actor_hidden_dims[0] if len(actor_hidden_dims) > 0 else 128
         critic_hidden = critic_hidden_dims_front[0] if len(critic_hidden_dims_front) > 0 else 64
-        self.actor = GATActor(num_agents, node_dim=obs_dim, hidden_dim=actor_hidden, action_dim=action_dim).to(device)
+        self.actor = ParallelAttentionActor(num_agents, node_dim=obs_dim, hidden_dim=actor_hidden, action_dim=action_dim).to(device)
         # critic: expects (batch, N, obs_dim)
-        self.critic = GATCritic(num_agents, node_dim=obs_dim, hidden_dim=critic_hidden).to(device)
+        self.critic = StructuredGATCritic(n_agents=num_agents, node_dim=obs_dim, n_landmarks=num_agents, hidden_dim=critic_hidden).to(device)
         
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
@@ -453,18 +751,53 @@ def main():
                         _, act = mappo.take_action(obs_dict[agent], explore=True)
                         actions[agent] = act
                         # 读取并存下该 agent 本次前向的注意力权重（若有）
-                        # 注意：通过GAT实现，权重结构已改为统一的注意力而非分离的lm/other
                         try:
-                            w = getattr(mappo.actor, 'last_attn_weights', None)
-                            if w is not None and isinstance(w, torch.Tensor):
-                                # w: (B, 1, 1) -> 提取单个样本的权重值
-                                w_scalar = float(w[0, 0, 0].item())  # 单节点自注意力值
-                                # 为了保持与原有结构的兼容性，同时追加到lm和other
-                                attn_by_agent[agent]['lm'].append(w_scalar)
-                                attn_by_agent[agent]['other'].append(w_scalar)
+                            w_lm = getattr(mappo.actor, 'last_attn_lm_weights', None)
+                            w_other = getattr(mappo.actor, 'last_attn_other_weights', None)
+                            def _proc(w):
+                                if w is None:
+                                    return None
+                                # collapse leading dims into batch and average to per-source vector
+                                if isinstance(w, torch.Tensor):
+                                    w = w.cpu()
+                                    src_len = w.size(-1)
+                                    w = w.view(-1, src_len).mean(dim=0).tolist()
+                                    return w
+                                return None
+                            plm = _proc(w_lm)
+                            pother = _proc(w_other)
+                            if plm is not None:
+                                attn_by_agent[agent]['lm'].append(plm)
+                            if pother is not None:
+                                attn_by_agent[agent]['other'].append(pother)
                         except Exception:
                             pass
 
+                # 打印 attention 权重用于调试（每 100 个 episode 打印一次）
+                if ep % 100 == 0:
+                    try:
+                        print(f"=== Ep {ep} attention summary ===")
+                        for agent in agents:
+                            lm_list = attn_by_agent[agent]['lm']
+                            other_list = attn_by_agent[agent]['other']
+                            def _avg_list(l):
+                                if not l:
+                                    return None
+                                a = np.array(l)
+                                return a.mean(axis=0)
+                            lm_avg = _avg_list(lm_list)
+                            other_avg = _avg_list(other_list)
+                            if lm_avg is not None:
+                                lm_str = ', '.join([f"{i}:{v:.4f}" for i, v in enumerate(lm_avg.tolist())])
+                            else:
+                                lm_str = 'None'
+                            if other_avg is not None:
+                                other_str = ', '.join([f"{i}:{v:.4f}" for i, v in enumerate(other_avg.tolist())])
+                            else:
+                                other_str = 'None'
+                            print(f"Agent {agent} - landmark_attn: [{lm_str}]  teammate_attn: [{other_str}]")
+                    except Exception as e:
+                        print('Failed to summarize attention:', e)
                 
                 # 环境前进一步
                 next_obs_dict, rewards, terminations, truncations, infos = env.step(actions)
