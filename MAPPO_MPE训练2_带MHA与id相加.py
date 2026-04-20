@@ -89,11 +89,11 @@ class ParallelAttentionActor(nn.Module):
         self.proj_lm = nn.Linear(2, hidden_dim)        # 地标: [rel_x, rel_y]
         self.proj_other = nn.Linear(2, hidden_dim)     # 队友: [rel_x, rel_y]
         
-        # 给每个地标一个唯一的身份 ID
-        self.lm_id_emb = nn.Embedding(n_agents, hidden_dim)
-        nn.init.orthogonal_(self.lm_id_emb.weight)
-        # 冻结参数，使其不再作为“噪声源”干扰训练
-        self.lm_id_emb.weight.requires_grad = False 
+        # # 给每个地标一个唯一的身份 ID
+        # self.lm_id_emb = nn.Embedding(n_agents, hidden_dim)
+        # nn.init.orthogonal_(self.lm_id_emb.weight)
+        # # 冻结参数，使其不再作为“噪声源”干扰训练
+        # self.lm_id_emb.weight.requires_grad = False 
         
         # 给智能体“我”id
         self.agent_id_emb = nn.Embedding(n_agents, hidden_dim)
@@ -151,14 +151,14 @@ class ParallelAttentionActor(nn.Module):
             my_id_feat = torch.zeros(batch_size, self.hidden_dim, device=device)
         q = q + my_id_feat.unsqueeze(1) # 注入身份偏置
         
-        # 投影地标特征        
-        # 【关键步骤】：给地标加上身份标签
-        # 生成 [0, 1, 2, ..., N-1] 的 ID
-        device = obs.device
-        lm_ids = torch.arange(self.n, device=device) # (N,)
-        ids_emb = self.lm_id_emb(lm_ids) # (N, H)
-        # 将 ID 嵌入加到地标特征上
-        k_lm = k_lm + ids_emb.unsqueeze(0) # 利用广播机制加到整个 Batch 上
+        # # 投影地标特征        
+        # # 【关键步骤】：给地标加上身份标签
+        # # 生成 [0, 1, 2, ..., N-1] 的 ID
+        # device = obs.device
+        # lm_ids = torch.arange(self.n, device=device) # (N,)
+        # ids_emb = self.lm_id_emb(lm_ids) # (N, H)
+        # # 将 ID 嵌入加到地标特征上
+        # k_lm = k_lm + ids_emb.unsqueeze(0) # 利用广播机制加到整个 Batch 上
 
         # --- 步骤 3: 并联注意力计算 ---
         # 3.1 地标支路 (通常地标永远存在，不设 Mask)
