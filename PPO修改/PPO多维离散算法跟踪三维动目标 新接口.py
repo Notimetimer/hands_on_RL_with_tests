@@ -23,13 +23,12 @@ matplotlib.use('Qt5Agg')
 
 from tracking_test2 import testEnv
 
-# 如果你在同一目录下，可以直接 import
-from Algorithms.PPOmultidiscrete import * 
-# from MLP_heads import PolicyNetMultiDiscrete, ValueNet
+# ==========================================
+# 1. 导入新的混合算法框架组件
+# ==========================================
+from Algorithms.PPOHybrid23_0 import PolicyNetHybrid, HybridActorWrapper, PPOHybrid
+from Algorithms.MLP_heads import ValueNet
 
-# ==========================================
-# 为了方便直接运行，这里粘贴极简的必要依赖 (基于你提供的文件)
-# ==========================================
 
 # ==========================================
 # 2. 辅助函数：离散动作 -> 连续动作转换
@@ -58,19 +57,19 @@ class ActionDiscretizer:
         continuous_actions = self.low + indices * self.step_size + self.step_size / 2.0
         return continuous_actions
 
+
 # ==========================================
 # 3. 主训练配置
 # ==========================================
-
 dt = 0.5
 dof = 3
 bins = 5  # 将每个动作维度切分为 5 份
 
 # 超参数
-actor_lr = 1e-4  # 离散算法通常可以使用稍微大一点的学习率，或者保持 1e-4
+actor_lr = 1e-4  
 critic_lr = 1e-3
 num_episodes = 500
-hidden_dim = [128, 128] # 稍微加深一点网络通常对离散动作有帮助
+hidden_dim =[128, 128] # 稍微加深一点网络通常对离散动作有帮助
 gamma = 0.9
 lmbda = 0.9
 epochs = 10
@@ -92,18 +91,29 @@ if torch.cuda.is_available():
 state_dim = env.observation_space.shape[0]
 raw_action_dim = env.action_space.shape[0] # 物理环境的动作维度 (3)
 
-# 定义多重离散动作空间
-# 3个维度，每个维度5个选项 -> action_dims = [5, 5, 5]
-action_dims = [bins] * raw_action_dim 
+# ==========================================
+# 定义混合动作空间参数：仅使用多重离散动作(cat)
+# ==========================================
+# x, y, z 3个维度，每个维度5个选项 -> 'cat': [5, 5, 5]
+action_dims_dict = {
+    'cont': 0,
+    'cat': [bins] * raw_action_dim, 
+    'bern': 0
+}
 
 # 初始化动作转换器
 discretizer = ActionDiscretizer(env.action_space.low, env.action_space.high, bins)
 
-# 初始化 Agent (使用 Multi-Discrete PPO)
-agent = PPO_multi_discrete(
-    state_dim=state_dim,
-    hidden_dims=hidden_dim,
-    action_dim=action_dims, # 传入列表 [5, 5, 5]
+# ==========================================
+# 实例化网络和 Agent (使用统一的 PPOHybrid)
+# ==========================================
+policy_net = PolicyNetHybrid(state_dim, hidden_dim, action_dims_dict).to(device)
+actor = HybridActorWrapper(policy_net, action_dims_dict, device=device).to(device)
+critic = ValueNet(state_dim, hidden_dim).to(device)
+
+agent = PPOHybrid(
+    actor=actor,
+    critic=critic,
     actor_lr=actor_lr,
     critic_lr=critic_lr,
     lmbda=lmbda,
@@ -114,36 +124,38 @@ agent = PPO_multi_discrete(
 )
 
 out_range_count = 0
-return_list = []
-start_time = None # 此处需要引入 time 库
+return_list =[]
 
 import time
 start_time = time.time()
 
+
 # ==========================================
 # 4. 训练循环
 # ==========================================
-
 with tqdm(total=int(num_episodes), desc='Iteration') as pbar:
     for i_episode in range(int(num_episodes)):
         episode_return = 0
         
-        # 这里的 transition_dict 只需要存储 discrete actions (indices)
+        # transition_dict 修改动作存储结构以适配 PPOHybrid23_0
         transition_dict = {
             'states': [], 
-            'actions': [], # 存索引，如 [2, 0, 4]
+            'actions': {'cat':[]},  # 以字典形式存储动作序列
             'next_states': [], 
             'rewards': [], 
-            'dones': []
+            'dones':[]
         }
         
         state, _ = env.reset(train=True)
         done = False
         
         while not done:
-            # 1. Agent 决策 (输出离散索引)
-            # take_action 返回 (probs_list, action_indices_list)
-            _, action_indices = agent.take_action(state, explore=True)
+            # 1. Agent 决策 
+            # take_action 返回: actions_exec, actions_raw, h_state, actions_dist_check
+            actions_exec, actions_raw, _, _ = agent.take_action(state, explore=True)
+            
+            # 获取执行用的离散动作索引
+            action_indices = actions_exec['cat']
             
             # 2. 将离散索引转换为连续动作以输入环境
             real_action = discretizer.discrete_to_continuous(action_indices)
@@ -152,9 +164,9 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:
             next_state, reward, terminated, truncated, info = env.step(real_action)
             done = bool(terminated or truncated)
             
-            # 4. 存储数据 (注意：存储的是 Agent 输出的 indices，不是 real_action)
+            # 4. 存储数据 (注意：存储 actions_raw 中的 raw indices)
             transition_dict['states'].append(state)
-            transition_dict['actions'].append(action_indices) # Store [int, int, int]
+            transition_dict['actions']['cat'].append(actions_raw['cat']) # Store array like[2, 0, 4]
             transition_dict['next_states'].append(next_state)
             transition_dict['rewards'].append(reward)
             transition_dict['dones'].append(done)
@@ -168,7 +180,6 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:
         return_list.append(episode_return)
         
         # 5. 更新 Agent
-        # PPO_multi_discrete.update 内部会自动处理 indices 的 log_prob 计算
         agent.update(transition_dict)
         
         if (i_episode + 1) >= 10:
@@ -179,10 +190,10 @@ with tqdm(total=int(num_episodes), desc='Iteration') as pbar:
 end_time = time.time()
 training_duration = end_time - start_time
 
+
 # ==========================================
 # 5. 绘图与测试
 # ==========================================
-
 def moving_average(a, window_size):
     cumulative_sum = np.cumsum(np.insert(a, 0, 0))
     middle = (cumulative_sum[window_size:] - cumulative_sum[:-window_size]) / window_size
@@ -196,28 +207,29 @@ plt.figure()
 plt.plot(episodes_list, return_list)
 plt.xlabel('Episodes')
 plt.ylabel('Returns')
-plt.title('PPO Multi-Discrete on {}'.format(env_name))
+plt.title('PPO Hybrid (Multi-Discrete) on {}'.format(env_name))
 
 mv_return = moving_average(return_list, 9)
 plt.figure()
 plt.plot(episodes_list, mv_return)
 plt.xlabel('Episodes')
 plt.ylabel('Smoothed Returns')
-plt.title('PPO Multi-Discrete on {}'.format(env_name))
+plt.title('PPO Hybrid (Multi-Discrete) on {}'.format(env_name))
 
 # --- 测试回合 ---
 car_trajectory = []
-target_trajectory = []
+target_trajectory =[]
 episode_return = 0
 
 state, _ = env.reset(train=False)
 done = False
 
 while not done:
-    # 测试时不探索 (explore=False)
-    _, action_indices = agent.take_action(state, explore=False)
+    # 测试时不探索 (explore=False 将透传为 {'cont': False, 'cat': False, 'bern': False})
+    actions_exec, _, _, _ = agent.take_action(state, explore=False)
     
-    # 转换动作
+    # 提取并转换动作
+    action_indices = actions_exec['cat']
     real_action = discretizer.discrete_to_continuous(action_indices)
     
     next_state, reward, terminated, truncated, info = env.step(real_action)
