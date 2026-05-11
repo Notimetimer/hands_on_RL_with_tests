@@ -1,5 +1,14 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
     "python-envs.defaultPackageManager": "ms-python.python:conda",
-    "git.ignoreLimitWarning": true
+    "git.ignoreLimitWarning": true,
+    // 强制关闭类型检查
+    "python.analysis.typeCheckingMode": "off",
+    // 针对可能被 IDE 重命名的插件，尝试通用的分析禁用
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportGeneralTypeIssues": "none",
+        "reportAttributeAccessIssue": "none",
+        "reportMissingImports": "none",
+        "reportUndefinedVariable": "none"
+    },
 }
