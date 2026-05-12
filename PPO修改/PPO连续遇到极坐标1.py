@@ -1,7 +1,6 @@
 """
-这个尝试取得了成功，
-使用两个维度构建Von Mises分布准确表示圆周上的概率分布,
-即使是在反向传播中也能够自动提取出有用的特征
+这个尝试是失败的，
+用独立的多元高斯分布去拟合非欧几里得空间耦合的角度关系不可取
 """
 import gym
 import numpy as np
@@ -122,72 +121,6 @@ def compute_advantage(gamma, lmbda, td_delta):
     advantage_list.reverse()
     return torch.tensor(advantage_list, dtype=torch.float)
 
-# 圆周空间下随机概率分布
-class CircularContDist4OnPolciy:
-    def __init__(self, mu_vec, std, eps=1e-8):
-        # mu_vec: (B, 2) 单位向量
-        self.eps = float(eps)
-        self.device = mu_vec.device
-        self.mu_vec = mu_vec.view(-1, 2)
-        self.std = std.to(self.device).view(-1, 1)
-
-        # kappa from equivalent std
-        self.kappa = 1.0 / (self.std.pow(2) + self.eps)
-
-    def log_prob(self, action_vec):
-        # action_vec: (B, 2) 经验池中的动作向量
-        action_vec = action_vec.view(-1, 2).to(self.device)
-        
-        # 使用点积代替 cos(theta - mu)
-        dot_product = torch.sum(action_vec * self.mu_vec, dim=-1, keepdim=True)
-        
-        if hasattr(torch.special, 'i0e'):
-            # log I0 = log(i0e(kappa)) + kappa
-            log_i0 = torch.log(torch.special.i0e(self.kappa).clamp(min=self.eps)) + self.kappa
-        else:
-            log_i0 = torch.log(torch.special.i0(self.kappa).clamp(min=self.eps))
-
-        log_norm = torch.log(torch.tensor(2.0 * np.pi, device=self.device)) + log_i0
-        return (self.kappa * dot_product) - log_norm
-
-    def sample(self):
-        # 采样依然基于 Von Mises 标量，随后转为向量存储
-        mu_rad = torch.atan2(self.mu_vec[:, 1], self.mu_vec[:, 0]).detach().cpu().numpy()
-        kappa_np = self.kappa.detach().cpu().numpy().reshape(-1)
-        
-        samples = np.array([np.random.vonmises(m, k) for m, k in zip(mu_rad, kappa_np)])
-        # 转回向量 (B, 2)
-        samples_vec = np.stack([np.cos(samples), np.sin(samples)], axis=1)
-        return torch.as_tensor(samples_vec, dtype=torch.float, device=self.device)
-
-    def entropy(self):
-        """使用指数缩放贝塞尔函数计算熵，提高数值稳定性"""
-        if hasattr(torch.special, 'i1e'):
-            # 使用缩放版本: In(k) = Ine(k) * exp(k)
-            i0e = torch.special.i0e(self.kappa).clamp(min=self.eps)
-            i1e = torch.special.i1e(self.kappa)
-            
-            # ratio = I1/I0 = I1e/I0e
-            ratio = i1e / i0e
-            
-            # log(I0) = log(i0e) + kappa
-            log_i0 = torch.log(i0e) + self.kappa
-            
-            # H = -kappa * (I1/I0) + log(2π) + log(I0)
-            # 带入缩放项后整理得：
-            ent = self.kappa * (1.0 - ratio) + torch.log(torch.tensor(2.0 * np.pi, device=self.device)) + torch.log(i0e)
-            return ent
-        else:
-            # 回退到标准版本（易溢出）
-            i0 = torch.special.i0(self.kappa).clamp(min=self.eps)
-            i1 = torch.special.i1(self.kappa)
-            return -self.kappa * (i1 / i0) + torch.log(torch.tensor(2.0 * np.pi, device=self.device)) + torch.log(i0)
-
-    def mean(self):
-        # 返回 (batch, 2) 的均值向量
-        return self.mu_vec
-
-
 class ValueNet(torch.nn.Module):
     def __init__(self, state_dim, hidden_dim):
         super(ValueNet, self).__init__()
@@ -204,49 +137,46 @@ class ValueNet(torch.nn.Module):
         y = self.net(x)
         return self.fc_out(y)
 
-class PolicyNetCircular(nn.Module):
-    def __init__(self, state_dim, hidden_dim, action_dim=2):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim, hidden_dim[0]), nn.ReLU(),
-            nn.Linear(hidden_dim[0], hidden_dim[0]), nn.ReLU()
-        )
-        self.fc_mu = nn.Linear(hidden_dim[0], action_dim) 
-        self.fc_std = nn.Linear(hidden_dim[0], 1)
+class PolicyNetContinuous(torch.nn.Module):
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super(PolicyNetContinuous, self).__init__()
+        layers = []
+        prev_size = state_dim
+        for layer_size in hidden_dim:
+            layers.append(nn.Linear(prev_size, layer_size))
+            layers.append(nn.ReLU())
+            prev_size = layer_size
+        self.net = nn.Sequential(*layers)
+        self.fc_mu = torch.nn.Linear(prev_size, action_dim)
+        self.mu_layer_norm = torch.nn.LayerNorm(action_dim)
+        self.fc_std = torch.nn.Linear(prev_size, action_dim)
 
-    def forward(self, x):
-        x = self.fc(x)
-        
-        # 1. 先用 tanh 保证分量在 (-1, 1) 之间且关于原点对称
-        mu_tanh = torch.tanh(self.fc_mu(x))
-        
-        # 2. 再通过 L2 归一化映射到单位圆，彻底消除奇异点
-        mu_vec = F.normalize(mu_tanh, p=2, dim=-1)
-        
+    def forward(self, x, action_bound=1.0):
+        x = self.net(x)
+        mu = action_bound * torch.tanh(self.fc_mu(x))
+        mu = self.mu_layer_norm(mu)
         std = F.softplus(self.fc_std(x)) + 1e-5
-        return mu_vec, std
+        return mu, std
 
 class PPOContinuous:
     def __init__(self, state_dim, hidden_dim, action_dim, actor_lr, critic_lr,
                  lmbda, epochs, eps, gamma, device):
-        self.actor = PolicyNetCircular(state_dim, hidden_dim).to(device) # 使用圆周网络
+        self.actor = PolicyNetContinuous(state_dim, hidden_dim, action_dim).to(device)
         self.critic = ValueNet(state_dim, hidden_dim).to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=critic_lr)
         self.gamma, self.lmbda, self.epochs, self.eps, self.device = gamma, lmbda, epochs, eps, device
 
-    def take_action(self, state, explore=True):
+    def take_action(self, state, action_bound=1.0, explore=True):
         state = torch.tensor([state], dtype=torch.float).to(self.device)
-        mu_vec, std = self.actor(state)
-        dist = CircularContDist4OnPolciy(mu_vec, std)
-        
+        mu, sigma = self.actor(state, action_bound=action_bound)
         if not explore:
-            action_vec = mu_vec.detach().cpu().numpy().flatten()
-        else:
-            action_vec = dist.sample().detach().cpu().numpy().flatten()
-        return action_vec # 此时 action_vec 已经是 [cos, sin] 形式
+            return mu[0].cpu().detach().numpy().flatten()
+        action_dist = torch.distributions.Normal(mu, sigma)
+        action = action_dist.sample()
+        return torch.clamp(action, -action_bound, action_bound)[0].cpu().detach().numpy().flatten()
 
-    def update(self, transition_dict):
+    def update(self, transition_dict, action_bound=1.0):
         states = torch.tensor(transition_dict['states'], dtype=torch.float).to(self.device)
         actions = torch.tensor(transition_dict['actions'], dtype=torch.float).to(self.device)
         rewards = torch.tensor(transition_dict['rewards'], dtype=torch.float).view(-1, 1).to(self.device)
@@ -258,14 +188,12 @@ class PPOContinuous:
         td_delta = td_target - self.critic(states)
         advantage = compute_advantage(self.gamma, self.lmbda, td_delta.cpu()).to(self.device)
 
-        mu_vec, std = self.actor(states)
-        old_dist = CircularContDist4OnPolciy(mu_vec, std)
-        old_log_probs = old_dist.log_prob(actions).detach()
+        mu, std = self.actor(states, action_bound=action_bound)
+        old_log_probs = torch.distributions.Normal(mu.detach(), std.detach()).log_prob(actions).sum(dim=-1, keepdim=True)
 
         for _ in range(self.epochs):
-            mu_v, s = self.actor(states)
-            new_dist = CircularContDist4OnPolciy(mu_v, s)
-            log_probs = new_dist.log_prob(actions)
+            mu, std = self.actor(states, action_bound=action_bound)
+            log_probs = torch.distributions.Normal(mu, std).log_prob(actions).sum(dim=-1, keepdim=True)
             
             ratio = torch.exp(log_probs - old_log_probs)
             surr1 = ratio * advantage
@@ -302,7 +230,6 @@ if __name__ == "__main__":
     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # 初始化智能体
-    # 注意：使用针对圆周分布设计的 PolicyNetCircular
     agent = PPOContinuous(
         state_dim=env.observation_space.shape[0], 
         hidden_dim=hidden_dim, 
